@@ -66,6 +66,10 @@ MAX_SESSION_SECONDS = 60 * 60     # 1 hour
 THREAD_CACHE_TTL_SECONDS = 5 * 60
 # How many stderr lines we keep per session, to feed to a retry session on failure
 STDERR_TAIL_LINES = 40
+# How many synthetic-error messages we keep per session (Claude Code surfaces
+# API errors and similar internal failures as assistant messages with
+# `model: "<synthetic>"`. We capture them to brief retry sessions.)
+SYNTHETIC_ERRORS_MAX = 10
 # Subtypes accepted as real user messages
 ALLOWED_MESSAGE_SUBTYPES = {None, "thread_broadcast", "file_share"}
 # Subtypes we explicitly log-and-drop so they're visible in debugging
@@ -397,10 +401,27 @@ class IncomingMessage:
         lines.append("## Why the previous session failed")
         lines.append(failure_summary)
 
+        synthetic_errors = ctx.get("synthetic_errors") or []
+        if synthetic_errors:
+            lines.append("")
+            lines.append(
+                "Synthetic error messages from Claude Code (these are the most "
+                "load-bearing signal — Claude Code surfaces API errors and other "
+                "internal failures here, NOT in stderr):"
+            )
+            lines.append("```")
+            for e in synthetic_errors:
+                lines.append(e)
+            lines.append("```")
+
         stderr_tail = ctx.get("stderr_tail") or []
         if stderr_tail:
             lines.append("")
-            lines.append(f"Stderr (last {len(stderr_tail)} lines from the failed session):")
+            lines.append(
+                f"Stderr (last {len(stderr_tail)} lines from the failed session — "
+                "treat as secondary signal; warnings here are often noise that "
+                "appears in successful sessions too):"
+            )
             lines.append("```")
             for s in stderr_tail:
                 # Scrub env values — this stderr will be summarised back into Slack.
@@ -410,7 +431,9 @@ class IncomingMessage:
         lines.append("")
         lines.append(
             "Remember: post ONCE, in the original thread, in your Slack voice. "
-            "Be honest about the failure. Suggest a fix if you can see one. Then exit."
+            "Be honest about the failure. Suggest a fix if you can see one. "
+            "Prefer the synthetic errors above over stderr when identifying the cause. "
+            "Then exit."
         )
         return "\n".join(lines)
 
@@ -428,6 +451,7 @@ class SessionResult:
     stuck: bool
     timed_out: bool
     stderr_tail: list[str] = field(default_factory=list)
+    synthetic_errors: list[str] = field(default_factory=list)
 
     @property
     def failed(self) -> bool:
@@ -447,6 +471,9 @@ class SamSession:
         self.last_output_at = time.monotonic()
         # Ring buffer of recent stderr — used to brief a retry session if this one fails
         self.stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
+        # Synthetic error messages observed in stdout (claude code surfaces API
+        # errors, etc., as assistant messages with model="<synthetic>")
+        self.synthetic_errors: deque[str] = deque(maxlen=SYNTHETIC_ERRORS_MAX)
 
     async def run(self) -> SessionResult:
         system_prompt = assemble_system_prompt()
@@ -500,9 +527,28 @@ class SamSession:
             assert self.proc and self.proc.stdout
             async for line in self.proc.stdout:
                 self.last_output_at = time.monotonic()
-                # Sam handles posting to Slack itself via its tools.
-                # We log here for debugging — could later parse for plan/status events.
-                log.debug("stdout: %s", line.decode().strip()[:200])
+                raw = line.decode().strip()
+                if not raw:
+                    continue
+                log.debug("stdout: %s", raw[:200])
+                # Stream-json: try to parse and extract synthetic error messages.
+                # These are claude code's way of surfacing API errors and similar
+                # internal failures — exactly the signal a retry session needs.
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "assistant":
+                    continue
+                msg = event.get("message") or {}
+                if msg.get("model") != "<synthetic>":
+                    continue
+                for block in msg.get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = (block.get("text") or "").strip()
+                        if text:
+                            self.synthetic_errors.append(text[:1000])
+                            log.warning("synthetic error: %s", text[:200])
 
         async def read_stderr() -> None:
             assert self.proc and self.proc.stderr
@@ -551,6 +597,7 @@ class SamSession:
             stuck=stuck,
             timed_out=timed_out,
             stderr_tail=list(self.stderr_tail),
+            synthetic_errors=list(self.synthetic_errors),
         )
 
         # Safety net journal entry — only if the session didn't write one,
@@ -910,6 +957,7 @@ class Daemon:
                         "stuck": first_result.stuck,
                         "timed_out": first_result.timed_out,
                         "stderr_tail": first_result.stderr_tail,
+                        "synthetic_errors": first_result.synthetic_errors,
                     },
                     raw_event=message.raw_event,
                 )
