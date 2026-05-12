@@ -4,6 +4,9 @@
 data/
 !data/.gitkeep
 
+# Sam's Claude Code credentials (written by `claude login` inside the container)
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]

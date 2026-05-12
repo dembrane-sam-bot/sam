@@ -7,7 +7,8 @@ services:
     volumes:
       # Sam's persistent state
       - ./data:/data
-      # Claude Code credentials from host
-      - ~/.claude:/home/sam/.claude:ro
+      # Sam logs in to Claude Code inside the container.
+      # Bind-mounted to ./.claude so you can inspect the contents from the host.
+      - ./.claude:/home/sam/.claude
     environment:
       - TZ=${TZ}

@@ -227,6 +227,7 @@ class SamSession:
         self.proc = await asyncio.create_subprocess_exec(
             "claude",
             "-p",                                  # print/non-interactive
+            "--verbose",                           # required by -p + stream-json output
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--include-partial-messages",
