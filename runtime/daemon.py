@@ -5,8 +5,10 @@ Responsibilities:
 - Listen for Slack events (Socket Mode, Agents & AI Apps surface)
 - For each incoming message that wakes Sam up, launch a Claude Code session
 - Stream Sam's output back to Slack as it arrives
-- Track threads Sam has participated in, so in-thread replies route back even
-  without an @-mention
+- Route in-thread replies by asking Slack whether Sam has posted in the thread
+  (no local thread bookkeeping; cached in-memory only)
+- Redirect messages received in the Agents & AI Apps side-pane back to the
+  whitelisted channel
 - On startup, replay messages missed while the daemon was offline
 - Maintain a single-instance lock and a journal safety net
 - Detect stuck sessions and clean them up
@@ -28,7 +30,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -52,15 +54,14 @@ JOURNAL_PATH = SAM_HOME / "journal.md"
 LOCK_PATH = SAM_HOME / "sam.lock"
 REPOS_DIR = SAM_HOME / "repos"
 CURSOR_PATH = SAM_HOME / "cursor.json"
-THREADS_PATH = SAM_HOME / "threads.json"
 
 # How long without any stdout/stderr output before we consider Sam stuck
 STUCK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes
 # Hard cap on a single session's wall clock
 MAX_SESSION_SECONDS = 60 * 60     # 1 hour
-# How long we remember a thread for in-thread reply routing
-THREAD_TRACKING_DAYS = 30
-# Subtypes accepted as real user messages in a tracked thread
+# How long to cache "has the bot posted in this thread?" lookups
+THREAD_CACHE_TTL_SECONDS = 5 * 60
+# Subtypes accepted as real user messages
 ALLOWED_MESSAGE_SUBTYPES = {None, "thread_broadcast", "file_share"}
 # Subtypes we explicitly log-and-drop so they're visible in debugging
 NOISY_MESSAGE_SUBTYPES = {"message_changed", "message_deleted", "bot_message"}
@@ -109,7 +110,7 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 # -----------------------------------------------------------------------------
-# Persisted cursor + thread tracking
+# Cursor persistence (a single Slack ts — the high-water mark for catch-up)
 # -----------------------------------------------------------------------------
 
 def load_cursor() -> Optional[str]:
@@ -129,35 +130,6 @@ def save_cursor(ts: str) -> None:
     if current and float(ts) <= float(current):
         return
     CURSOR_PATH.write_text(json.dumps({"last_seen_ts": ts}))
-
-def load_tracked_threads() -> dict[str, str]:
-    """Map of 'channel:thread_ts' -> iso timestamp first tracked."""
-    if not THREADS_PATH.exists():
-        return {}
-    try:
-        return json.loads(THREADS_PATH.read_text())
-    except (json.JSONDecodeError, OSError):
-        log.warning("threads.json unreadable, treating as empty")
-        return {}
-
-def save_tracked_threads(threads: dict[str, str]) -> None:
-    SAM_HOME.mkdir(parents=True, exist_ok=True)
-    THREADS_PATH.write_text(json.dumps(threads, indent=2, sort_keys=True))
-
-def track_thread(channel: str, thread_ts: str) -> None:
-    """Remember (channel, thread_ts) so we route future replies in this thread."""
-    threads = load_tracked_threads()
-    key = f"{channel}:{thread_ts}"
-    if key in threads:
-        return
-    now = datetime.now(tz=timezone.utc)
-    threads[key] = now.isoformat()
-    cutoff = (now - timedelta(days=THREAD_TRACKING_DAYS)).isoformat()
-    threads = {k: v for k, v in threads.items() if v >= cutoff}
-    save_tracked_threads(threads)
-
-def is_tracked_thread(channel: str, thread_ts: str) -> bool:
-    return f"{channel}:{thread_ts}" in load_tracked_threads()
 
 # -----------------------------------------------------------------------------
 # System prompt assembly
@@ -423,10 +395,16 @@ class Daemon:
         self.session_lock = asyncio.Lock()
         self.shutdown_event = asyncio.Event()
         self.bot_user_id: Optional[str] = None
+        self.sam_channel_name: Optional[str] = None
         # Recent message ts values we've already queued, to dedupe app_mention
         # and message events that fire for the same underlying Slack message.
         self._seen_ts: set[str] = set()
         self._seen_ts_order: list[str] = []
+        # In-memory cache: 'channel:thread_ts' -> (bot_has_posted, cached_at)
+        self._thread_cache: dict[str, tuple[bool, float]] = {}
+        # Channel ids seen via assistant_thread_started; used as a fallback to
+        # detect side-pane messages that don't carry an `assistant_thread` field.
+        self._assistant_thread_channels: set[str] = set()
 
         self._register_handlers()
 
@@ -448,6 +426,53 @@ class Daemon:
             return False
         return True
 
+    def _is_side_pane_event(self, event: dict) -> bool:
+        """Detect Agents & AI Apps assistant-thread (side-pane) messages.
+
+        Two signals: an `assistant_thread` field on the event (Slack's own
+        marker), or a channel we've previously seen open via
+        `assistant_thread_started`.
+        """
+        if event.get("assistant_thread"):
+            return True
+        channel = event.get("channel")
+        return bool(channel and channel in self._assistant_thread_channels)
+
+    async def _bot_participates_in_thread(self, channel: str, thread_ts: str) -> bool:
+        """Has the bot ever posted in this thread?
+
+        Cached in-memory with TTL. On Slack API failure, returns False
+        (conservative — better to miss a reply than to spam from a
+        confused state).
+        """
+        key = f"{channel}:{thread_ts}"
+        cached = self._thread_cache.get(key)
+        if cached is not None and time.monotonic() - cached[1] < THREAD_CACHE_TTL_SECONDS:
+            return cached[0]
+        try:
+            resp = await self.app.client.conversations_replies(
+                channel=channel, ts=thread_ts, limit=200,
+            )
+        except Exception:
+            log.exception("conversations.replies failed for %s", key)
+            return False
+        participates = False
+        for msg in resp.get("messages", []):
+            if msg.get("bot_id") or msg.get("user") == self.bot_user_id:
+                participates = True
+                break
+        self._thread_cache[key] = (participates, time.monotonic())
+        return participates
+
+    async def _send_side_pane_redirect(self, channel: str) -> None:
+        target = f"#{self.sam_channel_name}" if self.sam_channel_name else "the configured channel"
+        text = f"i live in {target} — talk to me there, not here."
+        try:
+            await self.app.client.chat_postMessage(channel=channel, text=text)
+            log.info("redirected side-pane message in %s", channel)
+        except Exception:
+            log.exception("failed to post side-pane redirect to %s", channel)
+
     def _register_handlers(self) -> None:
         @self.app.event("app_mention")
         async def on_app_mention(event, client):
@@ -462,26 +487,35 @@ class Daemon:
             if subtype not in ALLOWED_MESSAGE_SUBTYPES:
                 log.debug("ignoring message subtype=%s", subtype)
                 return
-            # Skip messages from the bot itself (defense in depth — usually
-            # bot_message subtype catches this, but not always).
             if event.get("bot_id") or event.get("user") == self.bot_user_id:
                 return
-            # Channel whitelist applies to all non-mention messages too.
             channel = event.get("channel")
+            if not channel:
+                return
+            # Side-pane (Agents & AI Apps) — redirect the user to the channel.
+            if self._is_side_pane_event(event):
+                await self._send_side_pane_redirect(channel)
+                return
             if not self._channel_allowed(channel):
                 return
-            # Only handle thread replies in threads we've previously been in.
-            # Top-level non-mention channel chatter is ignored on purpose.
+            # In a channel: only act on thread replies in threads where the
+            # bot has already posted. Top-level non-mention chatter is
+            # ignored on purpose (app_mention handles new mentions).
             thread_ts = event.get("thread_ts")
             if not thread_ts:
                 return
-            if not is_tracked_thread(channel, thread_ts):
+            if not await self._bot_participates_in_thread(channel, thread_ts):
                 return
             await self._handle_event(event)
 
         @self.app.event("assistant_thread_started")
         async def on_assistant_thread_started(event, client):
-            log.info("assistant_thread_started: %s", event)
+            thread = event.get("assistant_thread") or {}
+            channel_id = thread.get("channel_id")
+            if channel_id:
+                self._assistant_thread_channels.add(channel_id)
+                await self._send_side_pane_redirect(channel_id)
+            log.info("assistant_thread_started in %s", channel_id)
 
         @self.app.event("reaction_added")
         async def on_reaction_added(event, client):
@@ -517,20 +551,28 @@ class Daemon:
             event_ts=ts,
             raw_event=event,
         )
-        # Sam replies in-thread; remember the thread so non-mention replies
-        # in it get routed back to Sam later.
-        track_thread(message.channel, message.thread_ts or message.event_ts)
+        # Pre-warm the thread-participation cache so subsequent replies in
+        # this thread route without a Slack round-trip.
+        self._thread_cache[f"{channel}:{message.thread_ts or ts}"] = (
+            True, time.monotonic(),
+        )
         save_cursor(ts)
         await self.queue.put(message)
         log.info("queued message from <@%s> in %s (ts=%s)",
                  message.user, message.channel, message.event_ts)
 
     async def _catch_up(self) -> None:
-        """Replay messages we missed while the daemon was offline.
+        """Replay messages missed while the daemon was offline.
 
-        Looks at the configured channel's recent history (for new @mentions)
-        and at every tracked thread (for non-mention replies). Bounded by the
-        last-seen cursor; on first run we skip backfill entirely.
+        Scans the whitelisted channel's history since the cursor:
+        - Top-level messages that @mention the bot are queued directly.
+        - Top-level messages whose `reply_users` includes the bot have their
+          replies fetched and queued (replies newer than the cursor).
+
+        Limitation: a thread whose parent ts is older than the cursor but
+        which received replies during downtime won't be discovered here.
+        Re-@mentioning in the thread surfaces it again. This is the trade-off
+        for not persisting any thread list locally.
         """
         last_seen = load_cursor()
         if last_seen is None:
@@ -538,62 +580,65 @@ class Daemon:
             save_cursor(f"{time.time():.6f}")
             return
 
+        if not SAM_CHANNEL:
+            log.info("catch-up: SAM_CHANNEL unset, skipping")
+            return
+
         log.info("catch-up: scanning since ts=%s", last_seen)
         client = self.app.client
         candidates: list[dict] = []
 
-        if SAM_CHANNEL:
-            try:
-                resp = await client.conversations_history(
-                    channel=SAM_CHANNEL,
-                    oldest=last_seen,
-                    inclusive=False,
-                    limit=200,
-                )
-                for msg in resp.get("messages", []):
-                    if msg.get("subtype") not in ALLOWED_MESSAGE_SUBTYPES:
-                        continue
-                    if msg.get("bot_id") or msg.get("user") == self.bot_user_id:
-                        continue
-                    text = msg.get("text", "")
-                    is_mention = (
-                        self.bot_user_id
-                        and f"<@{self.bot_user_id}>" in text
-                    )
-                    if not is_mention:
-                        continue
-                    msg["channel"] = SAM_CHANNEL
-                    candidates.append(msg)
-            except Exception:
-                log.exception("catch-up: history fetch failed")
+        try:
+            resp = await client.conversations_history(
+                channel=SAM_CHANNEL,
+                oldest=last_seen,
+                inclusive=False,
+                limit=200,
+            )
+            top_level = resp.get("messages", [])
+        except Exception:
+            log.exception("catch-up: history fetch failed")
+            top_level = []
 
-        for key in list(load_tracked_threads().keys()):
-            channel, _, thread_ts = key.partition(":")
-            if not channel or not thread_ts:
+        for msg in top_level:
+            if msg.get("subtype") not in ALLOWED_MESSAGE_SUBTYPES:
                 continue
-            if not self._channel_allowed(channel):
+            if msg.get("bot_id") or msg.get("user") == self.bot_user_id:
+                continue
+            text = msg.get("text", "")
+            if self.bot_user_id and f"<@{self.bot_user_id}>" in text:
+                msg["channel"] = SAM_CHANNEL
+                candidates.append(msg)
+
+        # Threads with bot participation that gained replies during downtime.
+        for msg in top_level:
+            if msg.get("reply_count", 0) <= 0:
+                continue
+            if self.bot_user_id not in (msg.get("reply_users") or []):
+                continue
+            thread_ts = msg.get("ts")
+            if not thread_ts:
                 continue
             try:
-                resp = await client.conversations_replies(
-                    channel=channel,
+                replies = await client.conversations_replies(
+                    channel=SAM_CHANNEL,
                     ts=thread_ts,
                     oldest=last_seen,
                     inclusive=False,
                     limit=200,
                 )
-                for msg in resp.get("messages", []):
-                    if msg.get("subtype") not in ALLOWED_MESSAGE_SUBTYPES:
-                        continue
-                    if msg.get("bot_id") or msg.get("user") == self.bot_user_id:
-                        continue
-                    # The replies endpoint always returns the thread parent;
-                    # skip it (we've already handled it on its original ts).
-                    if msg.get("ts") == thread_ts:
-                        continue
-                    msg["channel"] = channel
-                    candidates.append(msg)
             except Exception:
-                log.exception("catch-up: replies fetch failed for %s", key)
+                log.exception("catch-up: replies fetch failed for thread %s", thread_ts)
+                continue
+            for reply in replies.get("messages", []):
+                if reply.get("ts") == thread_ts:
+                    continue
+                if reply.get("subtype") not in ALLOWED_MESSAGE_SUBTYPES:
+                    continue
+                if reply.get("bot_id") or reply.get("user") == self.bot_user_id:
+                    continue
+                reply["channel"] = SAM_CHANNEL
+                candidates.append(reply)
 
         # Chronological, deduped by ts.
         candidates.sort(key=lambda m: float(m["ts"]))
@@ -630,6 +675,16 @@ class Daemon:
             log.info("authenticated as bot user %s", self.bot_user_id)
         except Exception:
             log.exception("auth.test failed; will not recognize own messages reliably")
+
+        # Resolve the SAM_CHANNEL id to a name so we can refer to it by #name
+        # in the side-pane redirect copy.
+        if SAM_CHANNEL:
+            try:
+                info = await self.app.client.conversations_info(channel=SAM_CHANNEL)
+                self.sam_channel_name = (info.get("channel") or {}).get("name")
+                log.info("Sam channel resolved: #%s (%s)", self.sam_channel_name, SAM_CHANNEL)
+            except Exception:
+                log.exception("conversations.info failed; side-pane redirect will use a generic phrase")
 
         worker_task = asyncio.create_task(self._worker())
         socket_task = asyncio.create_task(self.handler.start_async())
