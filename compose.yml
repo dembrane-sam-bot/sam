@@ -1,0 +1,13 @@
+services:
+  sam:
+    build: .
+    container_name: sam
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Sam's persistent state
+      - ./data:/data
+      # Claude Code credentials from host
+      - ~/.claude:/home/sam/.claude:ro
+    environment:
+      - TZ=${TZ}

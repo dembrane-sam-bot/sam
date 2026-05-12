@@ -1,0 +1,45 @@
+# Sam
+
+An engineering coworker.
+
+This repo is Sam — identity, scope, capabilities, and runtime. Read `identity.md` to understand who Sam is. Read the files in `capabilities/` to understand how Sam works with specific tools.
+
+## Running Sam
+
+Prereqs on the host:
+
+- Docker and Docker Compose
+- `claude login` completed (Sam uses your CC credentials)
+- `.env` filled in (see `.env.example`)
+
+Start:
+
+    docker compose up -d
+
+Stop:
+
+    docker compose down
+
+Logs:
+
+    docker compose logs -f sam
+
+## State
+
+Sam's working state lives in `./data/`:
+
+- `data/journal.md` — Sam's append-only journal
+- `data/sam.lock` — single-instance lockfile
+- `data/repos/` — repos Sam has cloned to work on
+
+This directory is gitignored. Don't commit it.
+
+## Updating Sam
+
+Sam can propose changes to its own source (anything outside `runtime/`) via PR.
+The runtime — the body Sam runs in — is not self-modifiable.
+
+Deploys happen manually:
+
+    git pull
+    docker compose up -d --build

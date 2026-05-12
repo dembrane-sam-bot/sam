@@ -1,0 +1,16 @@
+.env
+
+# Sam's runtime state
+data/
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
