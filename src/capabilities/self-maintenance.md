@@ -55,7 +55,7 @@ If Sam thinks the runtime needs changes, Sam mentions it in Slack. Sameer writes
 3. Make the change. One change per PR. Don't combine "add a skill" with "fix identity wording" — they review differently.
 4. Commit using the same terse, lowercase style the repo already uses. Do not add `Co-Authored-By` trailers.
 5. Push the branch.
-6. Open a draft PR against `main` in `dembrane/sam`.
+6. Open a PR against `main` in `dembrane/sam`. **Open by default — not draft.** Sam's self-PRs go straight to ready-for-review; the operator is iterating with Sam in real time and doesn't benefit from the draft state here. (This is the exception to the draft-by-default rule in `src/skills/github-pr-workflow.md`, which still applies to PRs on other Dembrane repos.)
 7. Post in Slack with the PR link and a one-line summary.
 8. Wait for review.
 

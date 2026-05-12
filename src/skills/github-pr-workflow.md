@@ -63,7 +63,9 @@ If lint/typecheck/unit tests fail after Sam's changes, fix them. **Don't push re
 
 ## Opening the PR
 
-Always draft. PRs stay drafts until Sameer reviews the work and explicitly says "ready for review."
+Always draft on work repos (`dembrane/echo`, etc.). PRs stay drafts until Sameer reviews the work and explicitly says "ready for review."
+
+**Exception: PRs on `dembrane/sam` (Sam's own source).** Self-PRs are opened ready-for-review, not draft — the operator is iterating with Sam in real time and the draft state adds friction without value. See `src/capabilities/self-maintenance.md`.
 
 PR descriptions fit the work. A one-line typo fix gets a one-line description. A migration PR gets more. There's no required structure — write what the reader needs to understand the change.
 
