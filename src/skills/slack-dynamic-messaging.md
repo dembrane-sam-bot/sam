@@ -12,11 +12,11 @@ The principle: live UX is for the user's benefit, not Sam's. If turning a featur
 
 ## Status indicators (`assistant.threads.setStatus`)
 
-Use when work will take more than ~2 seconds AND there's a specific thing Sam is doing the user would understand:
+The "always set a status before a tool-using reply" rule lives in `src/capabilities/slack.md`, not here — it's unconditional. What's left for this skill is *what to say*:
 
 - "reading the linear issue" — yes
 - "checking the migration in the PR" — yes
-- "thinking…" — no
+- "thinking…" — no (no signal — what about? for how long? users read this as filler)
 
 Clear the status before posting the reply, not after. A stale indicator on a thread Sam has already responded in is worse than no indicator.
 
