@@ -690,13 +690,21 @@ class Daemon:
     def _is_side_pane_event(self, event: dict) -> bool:
         """Detect Agents & AI Apps assistant-thread (side-pane) messages.
 
-        Two signals: an `assistant_thread` field on the event (Slack's own
-        marker), or a channel we've previously seen open via
-        `assistant_thread_started`.
+        Slack delivers side-pane messages to a separate channel id from
+        the workspace channel. So anything arriving on the whitelisted
+        SAM_CHANNEL is, by definition, NOT a side-pane event — even when
+        Slack staples an `assistant_thread` field onto it as workspace-
+        level metadata (which it does for assistant-type apps).
+
+        After that short-circuit, two signals: an `assistant_thread`
+        field on the event, or a channel id we've previously seen open
+        via `assistant_thread_started`.
         """
+        channel = event.get("channel")
+        if SAM_CHANNEL and channel == SAM_CHANNEL:
+            return False
         if event.get("assistant_thread"):
             return True
-        channel = event.get("channel")
         return bool(channel and channel in self._assistant_thread_channels)
 
     async def _bot_participates_in_thread(self, channel: str, thread_ts: str) -> bool:
