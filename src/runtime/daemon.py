@@ -71,6 +71,49 @@ ALLOWED_MESSAGE_SUBTYPES = {None, "thread_broadcast", "file_share"}
 # Subtypes we explicitly log-and-drop so they're visible in debugging
 NOISY_MESSAGE_SUBTYPES = {"message_changed", "message_deleted", "bot_message"}
 
+# Secret-redaction: minimum env value length to consider for redaction.
+# Short values produce too many false positives in normal text
+# (e.g. TZ=Europe/Amsterdam, SAM_HOME=/data, country codes).
+REDACT_MIN_LEN = 8
+REDACT_PLACEHOLDER = "xxxx"
+
+# -----------------------------------------------------------------------------
+# Secret redaction — defense-in-depth for anything the daemon posts to Slack
+# -----------------------------------------------------------------------------
+
+def _build_redaction_values() -> list[str]:
+    """Collect env var values worth scrubbing from outbound Slack content.
+
+    Skips values shorter than `REDACT_MIN_LEN` (would clobber benign matches).
+    Sorted longest-first so a substring of a longer secret can't get partially
+    redacted before the longer secret is matched.
+    """
+    values = {v for v in os.environ.values() if v and len(v) >= REDACT_MIN_LEN}
+    return sorted(values, key=len, reverse=True)
+
+
+_REDACT_VALUES: list[str] = _build_redaction_values()
+
+
+def redact_secrets(text: Optional[str]) -> str:
+    """Replace any env var value found in `text` with the redaction placeholder.
+
+    Defense-in-depth for daemon-originated Slack posts. Sam should never put
+    a secret into a message in the first place; this catches it if Sam ever
+    does, before the bytes leave the process.
+
+    Built once at import from the live env. If the env changes after import,
+    the table is stale — acceptable, since the daemon's env doesn't change
+    at runtime.
+    """
+    if not text:
+        return text or ""
+    out = text
+    for v in _REDACT_VALUES:
+        if v in out:
+            out = out.replace(v, REDACT_PLACEHOLDER)
+    return out
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
@@ -360,7 +403,8 @@ class IncomingMessage:
             lines.append(f"Stderr (last {len(stderr_tail)} lines from the failed session):")
             lines.append("```")
             for s in stderr_tail:
-                lines.append(s)
+                # Scrub env values — this stderr will be summarised back into Slack.
+                lines.append(redact_secrets(s))
             lines.append("```")
 
         lines.append("")
@@ -638,7 +682,7 @@ class Daemon:
         target = f"#{self.sam_channel_name}" if self.sam_channel_name else "the configured channel"
         text = f"i live in {target} — talk to me there, not here."
         try:
-            await self.app.client.chat_postMessage(channel=channel, text=text)
+            await self.app.client.chat_postMessage(channel=channel, text=redact_secrets(text))
             log.info("redirected side-pane message in %s", channel)
         except Exception:
             log.exception("failed to post side-pane redirect to %s", channel)
@@ -918,7 +962,7 @@ class Daemon:
             await self.app.client.chat_postMessage(
                 channel=original.channel,
                 thread_ts=original.thread_ts or original.event_ts,
-                text=text,
+                text=redact_secrets(text),
             )
         except Exception:
             log.exception("operator alert post failed")
