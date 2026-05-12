@@ -29,6 +29,7 @@ import signal
 import sys
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,7 @@ load_dotenv()
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SAM_CHANNEL = os.environ.get("SAM_CHANNEL")  # optional: restrict to one channel for v0
+SAM_OPERATOR_USER_ID = os.environ.get("SAM_OPERATOR_USER_ID")  # @-mentioned when both attempts fail
 SAM_HOME = Path(os.environ.get("SAM_HOME", "/data"))
 SAM_REPO = Path("/home/sam")          # where Sam's checkout lives in the container
 SAM_SRC = SAM_REPO / "src"            # identity, scope, capabilities, skills, runtime
@@ -62,6 +64,8 @@ STUCK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes
 MAX_SESSION_SECONDS = 60 * 60     # 1 hour
 # How long to cache "has the bot posted in this thread?" lookups
 THREAD_CACHE_TTL_SECONDS = 5 * 60
+# How many stderr lines we keep per session, to feed to a retry session on failure
+STDERR_TAIL_LINES = 40
 # Subtypes accepted as real user messages
 ALLOWED_MESSAGE_SUBTYPES = {None, "thread_broadcast", "file_share"}
 # Subtypes we explicitly log-and-drop so they're visible in debugging
@@ -274,10 +278,14 @@ class IncomingMessage:
     thread_ts: Optional[str]  # If part of a thread; else None
     event_ts: str
     files: list[dict] = field(default_factory=list)
+    retry_context: Optional[dict] = None  # Set on a one-shot retry session after a failed first attempt
     raw_event: dict = field(repr=False, default_factory=dict)
 
     def to_initial_user_message(self) -> str:
         """Format as the first user message into Sam's session."""
+        if self.retry_context:
+            return self._format_retry_message()
+
         thread_part = f"thread_ts={self.thread_ts}" if self.thread_ts else "no thread"
         body = (
             f"Slack message in channel {self.channel} from <@{self.user}> ({thread_part}):\n\n"
@@ -302,6 +310,66 @@ class IncomingMessage:
         )
         return body
 
+    def _format_retry_message(self) -> str:
+        """Initial user message for a one-shot retry after a failed session.
+
+        Tells Sam: don't redo the task. Read what went wrong, post a single
+        reply in the original thread explaining it, then exit.
+        """
+        ctx = self.retry_context or {}
+        thread_target = self.thread_ts or self.event_ts
+        thread_part = f"thread_ts={self.thread_ts}" if self.thread_ts else "no thread"
+
+        if ctx.get("stuck"):
+            failure_summary = "STUCK — no output for the stuck-detection window (the daemon killed the process)."
+        elif ctx.get("timed_out"):
+            failure_summary = "TIMED_OUT — exceeded the per-session wall-clock cap (the daemon killed the process)."
+        else:
+            failure_summary = f"Exited with non-zero code: {ctx.get('exit_code')}."
+
+        lines = [
+            "A previous Sam session attempting to respond to a Slack message FAILED.",
+            "Do not retry the original task. Your one job in this session is:",
+            "",
+            f"1. Read the failure context below.",
+            f"2. Post ONE reply in the original Slack thread (channel={self.channel}, thread_ts={thread_target}) in your normal Slack voice. Name what failed in human terms, name the likely cause, and suggest a concrete fix. Don't dump stderr verbatim — read it, summarise it.",
+            "3. Then stop. This is a one-shot. The daemon will not retry again.",
+            "",
+            "## What the previous session was trying to handle",
+            f"From <@{self.user}> in channel {self.channel} ({thread_part}):",
+            "",
+            self.text,
+        ]
+
+        if self.files:
+            lines.append("")
+            lines.append("Attached files (from the original message):")
+            for f in self.files:
+                name = f.get("name") or f.get("id") or "<unnamed>"
+                mime = f.get("mimetype") or "unknown/unknown"
+                size = _format_file_size(f.get("size"))
+                lines.append(f"- `{name}` ({mime}, {size})")
+
+        lines.append("")
+        lines.append("## Why the previous session failed")
+        lines.append(failure_summary)
+
+        stderr_tail = ctx.get("stderr_tail") or []
+        if stderr_tail:
+            lines.append("")
+            lines.append(f"Stderr (last {len(stderr_tail)} lines from the failed session):")
+            lines.append("```")
+            for s in stderr_tail:
+                lines.append(s)
+            lines.append("```")
+
+        lines.append("")
+        lines.append(
+            "Remember: post ONCE, in the original thread, in your Slack voice. "
+            "Be honest about the failure. Suggest a fix if you can see one. Then exit."
+        )
+        return "\n".join(lines)
+
 # -----------------------------------------------------------------------------
 # Sam session — one Claude Code subprocess per Slack interaction
 # -----------------------------------------------------------------------------
@@ -315,6 +383,11 @@ class SessionResult:
     last_output_at: float
     stuck: bool
     timed_out: bool
+    stderr_tail: list[str] = field(default_factory=list)
+
+    @property
+    def failed(self) -> bool:
+        return self.stuck or self.timed_out or bool(self.exit_code)
 
 class SamSession:
     """Runs one Claude Code session against one incoming message.
@@ -328,6 +401,8 @@ class SamSession:
         self.session_id = uuid.uuid4().hex[:12]
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.last_output_at = time.monotonic()
+        # Ring buffer of recent stderr — used to brief a retry session if this one fails
+        self.stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
 
     async def run(self) -> SessionResult:
         system_prompt = assemble_system_prompt()
@@ -389,7 +464,9 @@ class SamSession:
             assert self.proc and self.proc.stderr
             async for line in self.proc.stderr:
                 self.last_output_at = time.monotonic()
-                log.warning("stderr: %s", line.decode().strip()[:200])
+                text = line.decode().rstrip()[:500]
+                self.stderr_tail.append(text)
+                log.warning("stderr: %s", text[:200])
 
         async def watch_stuck() -> None:
             nonlocal stuck, timed_out
@@ -429,6 +506,7 @@ class SamSession:
             last_output_at=self.last_output_at,
             stuck=stuck,
             timed_out=timed_out,
+            stderr_tail=list(self.stderr_tail),
         )
 
         # Safety net journal entry — only if the session didn't write one,
@@ -748,7 +826,13 @@ class Daemon:
         log.info("catch-up: queued %d message(s)", queued)
 
     async def _worker(self) -> None:
-        """Single worker that drains the queue, one session at a time."""
+        """Single worker that drains the queue, one session at a time.
+
+        On failure (exit != 0, stuck, or timed_out), the worker runs ONE
+        retry session whose only job is to read the failure context and
+        post a single explanatory reply in the original thread. If the
+        retry also fails, the daemon posts an operator-alert directly.
+        """
         while not self.shutdown_event.is_set():
             try:
                 message = await asyncio.wait_for(self.queue.get(), timeout=1.0)
@@ -756,11 +840,88 @@ class Daemon:
                 continue
 
             async with self.session_lock:
-                session = SamSession(message)
+                first = SamSession(message)
                 try:
-                    await session.run()
+                    first_result = await first.run()
                 except Exception:
                     log.exception("session crashed")
+                    first_result = None
+
+                if first_result is None or not first_result.failed:
+                    continue
+
+                log.info(
+                    "session failed (exit=%s stuck=%s timed_out=%s); spawning one-shot retry",
+                    first_result.exit_code, first_result.stuck, first_result.timed_out,
+                )
+                retry_message = IncomingMessage(
+                    channel=message.channel,
+                    user=message.user,
+                    text=message.text,
+                    thread_ts=message.thread_ts,
+                    event_ts=message.event_ts,
+                    files=message.files,
+                    retry_context={
+                        "exit_code": first_result.exit_code,
+                        "stuck": first_result.stuck,
+                        "timed_out": first_result.timed_out,
+                        "stderr_tail": first_result.stderr_tail,
+                    },
+                    raw_event=message.raw_event,
+                )
+                retry = SamSession(retry_message)
+                try:
+                    retry_result = await retry.run()
+                except Exception:
+                    log.exception("retry session crashed")
+                    retry_result = None
+
+                if retry_result is None or retry_result.failed:
+                    log.warning(
+                        "retry session also failed (exit=%s); posting operator alert",
+                        retry_result.exit_code if retry_result else "n/a",
+                    )
+                    await self._post_operator_alert(message, first_result, retry_result)
+
+    async def _post_operator_alert(
+        self,
+        original: IncomingMessage,
+        first: SessionResult,
+        retry: Optional[SessionResult],
+    ) -> None:
+        """Posted directly by the daemon when both attempts fail.
+
+        No claude subprocess — this has to work even when claude itself is
+        the thing that's broken. Keep the text short and concrete.
+        """
+        mention = f"<@{SAM_OPERATOR_USER_ID}> " if SAM_OPERATOR_USER_ID else ""
+        first_status = (
+            "stuck" if first.stuck
+            else "timed out" if first.timed_out
+            else f"exit {first.exit_code}"
+        )
+        if retry is None:
+            retry_status = "crashed before reporting"
+        elif retry.stuck:
+            retry_status = "stuck"
+        elif retry.timed_out:
+            retry_status = "timed out"
+        else:
+            retry_status = f"exit {retry.exit_code}"
+
+        text = (
+            f"{mention}something's wrong with me — i tried to respond and {first_status}, "
+            f"then tried to explain what failed and that also {retry_status}. "
+            f"need your eyes."
+        )
+        try:
+            await self.app.client.chat_postMessage(
+                channel=original.channel,
+                thread_ts=original.thread_ts or original.event_ts,
+                text=text,
+            )
+        except Exception:
+            log.exception("operator alert post failed")
 
     async def run(self) -> None:
         # Identify ourselves so we can recognize and skip our own messages.
