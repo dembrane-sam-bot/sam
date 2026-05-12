@@ -67,6 +67,24 @@ Always draft. PRs stay drafts until Sameer reviews the work and explicitly says 
 
 PR descriptions fit the work. A one-line typo fix gets a one-line description. A migration PR gets more. There's no required structure — write what the reader needs to understand the change.
 
+## Labels (sam repo only)
+
+When opening a PR on `dembrane/sam`, attach a label per source area the diff touches. This is how reviewers see the tier at a glance without opening the file list.
+
+- `identity` — `src/identity.md`
+- `scope` — `src/scope.md`
+- `capabilities` — anything under `src/capabilities/`
+- `skill` — anything under `src/skills/`
+- `runtime` — anything under `src/runtime/`, the `Dockerfile`, `compose.yml`, or top-level config
+
+Multi-area PRs get multiple labels. Apply at PR-open time:
+
+```
+gh pr edit <number> --repo dembrane/sam --add-label <comma-separated>
+```
+
+Other Dembrane repos don't use this scheme.
+
 **One section is always present: Confidence.** A sentence on how solid the work is and what would shake that confidence.
 
 > Confidence: high. Pure refactor, no behavior change, all existing tests pass and I added two more.
