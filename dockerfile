@@ -26,8 +26,8 @@ USER sam
 WORKDIR /home/sam
 
 # Python deps
-COPY --chown=sam:sam runtime/requirements.txt /home/sam/runtime/requirements.txt
-RUN pip install --user --break-system-packages -r /home/sam/runtime/requirements.txt
+COPY --chown=sam:sam src/runtime/requirements.txt /home/sam/src/runtime/requirements.txt
+RUN pip install --user --break-system-packages -r /home/sam/src/runtime/requirements.txt
 ENV PATH="/home/sam/.local/bin:${PATH}"
 
 # Sam's source — copied last so code changes don't bust dep cache
@@ -36,4 +36,4 @@ COPY --chown=sam:sam . /home/sam/
 # Volume for state
 VOLUME ["/data"]
 
-CMD ["python3", "-m", "runtime.daemon"]
+CMD ["python3", "-m", "src.runtime.daemon"]

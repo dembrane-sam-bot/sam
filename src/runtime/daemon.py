@@ -48,7 +48,8 @@ SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SAM_CHANNEL = os.environ.get("SAM_CHANNEL")  # optional: restrict to one channel for v0
 SAM_HOME = Path(os.environ.get("SAM_HOME", "/data"))
-SAM_REPO = Path("/home/sam")  # where Sam's source lives inside the container
+SAM_REPO = Path("/home/sam")          # where Sam's checkout lives in the container
+SAM_SRC = SAM_REPO / "src"            # identity, scope, capabilities, skills, runtime
 
 JOURNAL_PATH = SAM_HOME / "journal.md"
 LOCK_PATH = SAM_HOME / "sam.lock"
@@ -135,8 +136,69 @@ def save_cursor(ts: str) -> None:
 # System prompt assembly
 # -----------------------------------------------------------------------------
 
+def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """Parse simple YAML-ish frontmatter from the top of a markdown file.
+
+    Supports only single-line `key: value` pairs (no nested structures, no
+    multi-line scalars). Returns (metadata, body). If no frontmatter is
+    present, returns ({}, text).
+    """
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}, text
+    head = text[4:end]
+    body = text[end + len("\n---\n"):]
+    meta: dict[str, str] = {}
+    for line in head.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        meta[key.strip()] = val.strip()
+    return meta, body
+
+
+def _build_skill_catalog(skills_dir: Path) -> str:
+    """Emit a frontmatter-only listing of skills.
+
+    Skills are NOT hot-loaded into the system prompt. The model sees only
+    name + description + when_to_use + path, and decides whether to Read
+    the full skill body when relevant.
+    """
+    entries: list[str] = []
+    for skill in sorted(skills_dir.glob("*.md")):
+        meta, _ = _parse_frontmatter(skill.read_text())
+        name = meta.get("name") or skill.stem
+        desc = meta.get("description")
+        when = meta.get("when_to_use") or meta.get("when to use")
+        if not desc:
+            log.warning("skill %s missing 'description' in frontmatter", skill)
+            desc = "(no description)"
+        rel = skill.relative_to(SAM_REPO)
+        line = f"- **{name}** — {desc}"
+        if when:
+            line += f"\n  *when to use:* {when}"
+        line += f"\n  *full content:* `Read {rel}`"
+        entries.append(line)
+    if not entries:
+        return ""
+    header = (
+        "# SKILLS (catalog only)\n\n"
+        "Skills are patterns Sam has learned. The listing below shows names "
+        "and descriptions; bodies are NOT included in this prompt. When a "
+        "skill matches your task, `Read` the listed path BEFORE applying it. "
+        "Don't guess what's in a skill — read it.\n"
+    )
+    return header + "\n" + "\n\n".join(entries)
+
+
 def assemble_system_prompt() -> str:
-    """Read identity, scope, all capabilities, and all skills.
+    """Build the system prompt for a Claude Code session.
+
+    Hot-loads identity, scope, and capabilities (stable, always relevant).
+    Skills are catalog-only — model reads them on demand.
 
     Re-read every session, so a `git pull` followed by next message picks up
     the new version of Sam.
@@ -147,16 +209,17 @@ def assemble_system_prompt() -> str:
         if path.exists():
             sections.append(f"# {header}\n\n{path.read_text()}")
 
-    _add(SAM_REPO / "identity.md", "IDENTITY")
-    _add(SAM_REPO / "scope.md", "SCOPE")
+    _add(SAM_SRC / "identity.md", "IDENTITY")
+    _add(SAM_SRC / "scope.md", "SCOPE")
 
-    for cap in sorted((SAM_REPO / "capabilities").glob("*.md")):
+    for cap in sorted((SAM_SRC / "capabilities").glob("*.md")):
         sections.append(f"# CAPABILITY: {cap.stem}\n\n{cap.read_text()}")
 
-    skills_dir = SAM_REPO / "skills"
+    skills_dir = SAM_SRC / "skills"
     if skills_dir.exists():
-        for skill in sorted(skills_dir.glob("*.md")):
-            sections.append(f"# SKILL: {skill.stem}\n\n{skill.read_text()}")
+        catalog = _build_skill_catalog(skills_dir)
+        if catalog:
+            sections.append(catalog)
 
     orchestration = """
 # ORCHESTRATION
@@ -170,13 +233,15 @@ Before responding, decide what context you need and go get it. Use:
 - The GitHub API and `gh` CLI for PRs, issues, code (`GITHUB_TOKEN` is in env)
 - The Slack Web API for posting back (`SLACK_BOT_TOKEN` is in env)
 - Repos cloned under `/data/repos/` (clone what you need, fetch what's stale)
+- Sam's own source under `src/` — identity, scope, capabilities, skills
 
 The Slack message that triggered this session is at the start of your
 conversation. The channel ID and thread timestamp are included so you can
 post back in the right place.
 
 Before you finish, append a journal entry describing what you did. Follow
-the format in `capabilities/journal.md`. This is how future-you remembers.
+the format in `src/capabilities/journal.md`. This is how future-you
+remembers.
 
 Be honest, terse, and useful. Don't perform engagement. Don't explain what
 you're about to do unless someone is going to be watching the status
@@ -190,6 +255,16 @@ indicator. Just do it, then say the result.
 # Slack helpers
 # -----------------------------------------------------------------------------
 
+def _format_file_size(num_bytes: Optional[int]) -> str:
+    if not num_bytes:
+        return "unknown size"
+    for unit in ("B", "KB", "MB", "GB"):
+        if num_bytes < 1024 or unit == "GB":
+            return f"{num_bytes:.0f} {unit}" if unit == "B" else f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} GB"
+
+
 @dataclass
 class IncomingMessage:
     """A Slack message that woke Sam up."""
@@ -198,17 +273,34 @@ class IncomingMessage:
     text: str
     thread_ts: Optional[str]  # If part of a thread; else None
     event_ts: str
-    raw_event: dict = field(repr=False)
+    files: list[dict] = field(default_factory=list)
+    raw_event: dict = field(repr=False, default_factory=dict)
 
     def to_initial_user_message(self) -> str:
         """Format as the first user message into Sam's session."""
         thread_part = f"thread_ts={self.thread_ts}" if self.thread_ts else "no thread"
-        return (
+        body = (
             f"Slack message in channel {self.channel} from <@{self.user}> ({thread_part}):\n\n"
             f"{self.text}\n\n"
+        )
+        if self.files:
+            lines = ["## Attached files\n"]
+            for f in self.files:
+                name = f.get("name") or f.get("id") or "<unnamed>"
+                mime = f.get("mimetype") or "unknown/unknown"
+                size = _format_file_size(f.get("size"))
+                url = f.get("url_private") or f.get("url_private_download") or ""
+                lines.append(f"- `{name}` ({mime}, {size}) — {url}")
+            lines.append(
+                "\nFetch only if the content is relevant to the task. "
+                "See `src/skills/slack-files.md` for the curl command and per-mimetype handling."
+            )
+            body += "\n".join(lines) + "\n\n"
+        body += (
             f"Reply in Slack via the Web API. If this is in a thread, reply in-thread "
             f"(use thread_ts={self.thread_ts or self.event_ts})."
         )
+        return body
 
 # -----------------------------------------------------------------------------
 # Sam session — one Claude Code subprocess per Slack interaction
@@ -543,12 +635,14 @@ class Daemon:
         if not user:
             return
 
+        files = event.get("files") or []
         message = IncomingMessage(
             channel=channel,
             user=user,
             text=event.get("text", ""),
             thread_ts=event.get("thread_ts"),
             event_ts=ts,
+            files=files,
             raw_event=event,
         )
         # Pre-warm the thread-participation cache so subsequent replies in
@@ -558,8 +652,9 @@ class Daemon:
         )
         save_cursor(ts)
         await self.queue.put(message)
-        log.info("queued message from <@%s> in %s (ts=%s)",
-                 message.user, message.channel, message.event_ts)
+        attachment_note = f" with {len(files)} attachment(s)" if files else ""
+        log.info("queued message from <@%s> in %s (ts=%s)%s",
+                 message.user, message.channel, message.event_ts, attachment_note)
 
     async def _catch_up(self) -> None:
         """Replay messages missed while the daemon was offline.

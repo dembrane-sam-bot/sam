@@ -2,15 +2,44 @@
 
 An engineering coworker.
 
-This repo is Sam — identity, scope, capabilities, and runtime. Read `identity.md` to understand who Sam is. Read the files in `capabilities/` to understand how Sam works with specific tools.
+This repo is Sam — identity, scope, capabilities, skills, and runtime. Read `src/identity.md` to understand who Sam is. Read files in `src/capabilities/` to understand the shape of Sam's work. Skills under `src/skills/` are the specific patterns Sam reaches for when triggered.
+
+## Layout
+
+    src/
+      identity.md         — who Sam is
+      scope.md            — what Sam works on
+      capabilities/*.md   — what Sam can always rely on knowing (hot-loaded into every session)
+      skills/*.md         — specific patterns, loaded on demand (catalog in system prompt, body via `Read`)
+      runtime/            — the daemon and supporting code (Tier 3 — not Sam-editable)
+
+    data/                 — Sam's working state (gitignored)
+    .claude/              — Sam's Claude Code credentials (gitignored, created by `claude login` inside the container)
+
+## Capabilities vs skills
+
+Both live under `src/` as markdown files, but they're loaded differently and serve different purposes:
+
+- **Capability** = identity-shaped, always-relevant. Voice, operational defaults, what Sam can/cannot do, principles. The daemon **hot-loads the full content** of every capability into the system prompt of every session.
+- **Skill** = a specific pattern Sam applies when a trigger condition fires. The daemon **emits only the frontmatter** (name + description + `when_to_use` + path) into the system prompt as a catalog; Sam decides to `Read src/skills/<name>.md` when the trigger matches.
+
+Rule of thumb: if Sam should know it on every message, it's a capability. If Sam only needs it sometimes, it's a skill. Don't promote a skill to a capability to save Sam a `Read` — the lazy-load design is deliberate.
+
+See `src/capabilities/self-maintenance.md` for the skill-frontmatter convention and the flow for proposing changes.
 
 ## Running Sam
 
 Prereqs on the host:
 
 - Docker and Docker Compose
-- `claude login` completed (Sam uses your CC credentials)
 - `.env` filled in (see `.env.example`)
+
+First-run auth (inside the container):
+
+    docker compose up -d --build
+    docker exec -it sam claude login
+
+After login, Sam's credentials persist in `./.claude/` across restarts. Re-login isn't required unless tokens are revoked.
 
 Start:
 
@@ -30,14 +59,14 @@ Sam's working state lives in `./data/`:
 
 - `data/journal.md` — Sam's append-only journal
 - `data/sam.lock` — single-instance lockfile
+- `data/cursor.json` — last-seen Slack ts (for catch-up after downtime)
 - `data/repos/` — repos Sam has cloned to work on
 
 This directory is gitignored. Don't commit it.
 
 ## Updating Sam
 
-Sam can propose changes to its own source (anything outside `runtime/`) via PR.
-The runtime — the body Sam runs in — is not self-modifiable.
+Sam can propose changes to anything in `src/` *except* `src/runtime/` via PR. See `src/capabilities/self-maintenance.md`. The runtime — the body Sam runs in — is Tier 3 and is written by Sameer.
 
 Deploys happen manually:
 
