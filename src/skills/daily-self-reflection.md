@@ -45,7 +45,7 @@ Walk each entry and ask:
 
 ## 3. Propose changes if there's substance
 
-If reflection surfaces something concrete to codify, open self-PRs via the `src/capabilities/self-maintenance.md` flow. **No artificial cap on how many** — open one per distinct concept, however many that is. Don't bundle unrelated edits to dodge the one-concept-per-PR rule.
+If reflection surfaces something concrete to codify, first decide where it belongs using `src/capabilities/self-maintenance.md` ("Where does a change belong?"), then open self-PRs via the same file's flow. **No artificial cap on how many** — open one per distinct concept, however many that is. Don't bundle unrelated edits to dodge the one-concept-per-PR rule.
 
 Each PR description names the specific behavior that triggered it (cite session ID), the file + line being changed, and the tier. Tier 2 changes only with explicit sign-off from the principal operator in the thread.
 

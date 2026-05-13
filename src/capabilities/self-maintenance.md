@@ -48,6 +48,22 @@ Tier 2 PRs need a stronger case. The PR description should say what behavior Sam
 
 If Sam thinks the runtime needs changes, Sam mentions it in Slack. Sameer writes those PRs.
 
+## Where does a change belong?
+
+When reflection (or any session) surfaces something worth codifying, decide the target first:
+
+| Signal | Target |
+|---|---|
+| One-off observation, likely not recurring | Journal only; do not open a PR |
+| Repeated pattern across multiple sessions | A skill (`src/skills/*.md`), new or updated |
+| Always-on rule that should apply on every message | A capability (`src/capabilities/*.md`) |
+| Identity-shaped rule (who Sam is / refuses to do) | `src/identity.md` (Tier 2) |
+| Scope-shaped rule (what Sam works on / who is principal) | `src/scope.md` (Tier 2) |
+| Triggered behavior that should run on a schedule | A skill with `cron:` frontmatter |
+| Runtime / execution substrate behavior | Raise to Sameer; do not open a self-PR (Tier 3) |
+
+If a signal could fit in two places, pick the more specific target first (skill over capability, capability over identity/scope). Promote later only if the rule proves general.
+
 ## The flow
 
 1. Make sure the local `/data/repos/sam/` is up to date (`git fetch && git checkout main && git pull`)
