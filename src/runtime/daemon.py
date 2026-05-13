@@ -733,6 +733,40 @@ class Daemon:
         self._thread_cache[key] = (participates, time.monotonic())
         return participates
 
+    async def _post_eyes_reaction(self, channel: str, ts: str) -> None:
+        """Add :eyes: to the inbound message so the user knows it landed.
+
+        Fired at queue time, BEFORE any session work. Bridges the gap between
+        the user hitting send and Sam actually running — especially noticeable
+        when there's a backlog and the message sits in the queue for a while.
+        Best-effort: `already_reacted` (double-fire on dedup races) and
+        `message_not_found` are both non-fatal — log and move on.
+        """
+        try:
+            await self.app.client.reactions_add(
+                channel=channel, timestamp=ts, name="eyes",
+            )
+        except Exception as e:
+            log.debug("reactions.add failed for %s/%s: %s", channel, ts, e)
+
+    async def _set_thinking_status(self, channel: str, thread_ts: str) -> None:
+        """Set 'sam is thinking…' status at session start.
+
+        Bridges the gap between the worker pulling a message off the queue
+        and Sam's first `setStatus` call from inside the session (which
+        normally happens after the session has read context, opened files,
+        etc. — several seconds in). Sam overwrites this with a more specific
+        status as soon as it knows what it's doing.
+        """
+        try:
+            await self.app.client.assistant_threads_setStatus(
+                channel_id=channel,
+                thread_ts=thread_ts,
+                status="sam is thinking…",
+            )
+        except Exception as e:
+            log.debug("setStatus failed for %s/%s: %s", channel, thread_ts, e)
+
     async def _send_side_pane_redirect(self, channel: str) -> None:
         target = f"#{self.sam_channel_name}" if self.sam_channel_name else "the configured channel"
         text = f"i live in {target} — talk to me there, not here."
@@ -828,6 +862,9 @@ class Daemon:
             True, time.monotonic(),
         )
         save_cursor(ts)
+        # Acknowledge receipt with :eyes: immediately, before the worker even
+        # picks the message up. Fire-and-forget — don't slow the queue down.
+        asyncio.create_task(self._post_eyes_reaction(channel, ts))
         await self.queue.put(message)
         attachment_note = f" with {len(files)} attachment(s)" if files else ""
         log.info("queued message from <@%s> in %s (ts=%s)%s",
@@ -939,6 +976,12 @@ class Daemon:
                 continue
 
             async with self.session_lock:
+                # Set a placeholder status before the session starts so the
+                # user sees "sam is thinking…" in the gap before Sam's own
+                # `setStatus` call kicks in. Sam overwrites this shortly.
+                await self._set_thinking_status(
+                    message.channel, message.thread_ts or message.event_ts,
+                )
                 first = SamSession(message)
                 try:
                     first_result = await first.run()
