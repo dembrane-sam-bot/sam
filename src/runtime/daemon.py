@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -66,6 +67,29 @@ def journal_path_for_today() -> Path:
     """Path to today's journal file. The directory is created if missing."""
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
     return JOURNAL_DIR / f"{datetime.now().date().isoformat()}.md"
+
+
+def _read_commit_sha() -> Optional[str]:
+    """Return the short commit SHA of the source the daemon is running from.
+
+    Read once at module import. Stable for the process lifetime — the
+    container is rebuilt to pick up new code, so the SHA doesn't shift
+    mid-run. Returns None if `git` isn't available or the working tree
+    isn't a git checkout (e.g. running outside docker for tests).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=2, cwd=str(SAM_REPO),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip() or None
+
+
+COMMIT_SHA: Optional[str] = _read_commit_sha()
 
 # How long without any stdout/stderr output before we consider Sam stuck
 STUCK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes
@@ -290,6 +314,11 @@ def assemble_system_prompt() -> str:
 You are Sam, running as a Claude Code session. Each time you wake up, you
 are responding to a Slack message that came in via the daemon.
 
+You are running source at commit `{commit_sha}`. When you propose a Tier 3
+(runtime) PR or talk publicly about behaviour changes, quote this commit so
+observers can tell whether what they're seeing is "live" or "pending the
+next container restart."
+
 Before responding, decide what context you need and go get it. Use:
 - The journal: one file per day at `/data/journal/<YYYY-MM-DD>.md`. Today's
   file is where you'll write this session's entry. The pre-directory combined
@@ -322,7 +351,7 @@ Be honest, terse, and useful. Don't perform engagement. Don't explain what
 you're about to do unless someone is going to be watching the status
 indicator. Just do it, then say the result.
 """
-    sections.append(orchestration)
+    sections.append(orchestration.format(commit_sha=COMMIT_SHA or "unknown"))
 
     return "\n\n---\n\n".join(sections)
 
@@ -1369,7 +1398,10 @@ class Daemon:
         if not cron_tasks:
             log.info("no skills with `cron:` frontmatter; no scheduled tasks running")
 
-        log.info("Sam daemon ready (channel=%s)", SAM_CHANNEL or "all")
+        log.info(
+            "Sam daemon ready (channel=%s, commit=%s)",
+            SAM_CHANNEL or "all", COMMIT_SHA or "unknown",
+        )
 
         await self.shutdown_event.wait()
 
