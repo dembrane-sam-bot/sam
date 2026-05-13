@@ -750,19 +750,23 @@ class Daemon:
             log.debug("reactions.add failed for %s/%s: %s", channel, ts, e)
 
     async def _set_thinking_status(self, channel: str, thread_ts: str) -> None:
-        """Set 'sam is thinking…' status at session start.
+        """Set 'is thinking…' status at session start.
 
         Bridges the gap between the worker pulling a message off the queue
         and Sam's first `setStatus` call from inside the session (which
         normally happens after the session has read context, opened files,
         etc. — several seconds in). Sam overwrites this with a more specific
         status as soon as it knows what it's doing.
+
+        Slack prepends the bot's display name to the status string, so the
+        status text starts with the verb. Passing "sam is thinking…" here
+        renders as "sam sam is thinking…" in the UI.
         """
         try:
             await self.app.client.assistant_threads_setStatus(
                 channel_id=channel,
                 thread_ts=thread_ts,
-                status="sam is thinking…",
+                status="is thinking…",
             )
         except Exception as e:
             log.debug("setStatus failed for %s/%s: %s", channel, thread_ts, e)
@@ -978,7 +982,8 @@ class Daemon:
             async with self.session_lock:
                 # Set a placeholder status before the session starts so the
                 # user sees "sam is thinking…" in the gap before Sam's own
-                # `setStatus` call kicks in. Sam overwrites this shortly.
+                # `setStatus` call kicks in (Slack prepends the bot name to
+                # the status text). Sam overwrites this shortly.
                 await self._set_thinking_status(
                     message.channel, message.thread_ts or message.event_ts,
                 )
