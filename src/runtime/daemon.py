@@ -53,10 +53,19 @@ SAM_HOME = Path(os.environ.get("SAM_HOME", "/data"))
 SAM_REPO = Path("/home/sam")          # where Sam's checkout lives in the container
 SAM_SRC = SAM_REPO / "src"            # identity, scope, capabilities, skills, runtime
 
-JOURNAL_PATH = SAM_HOME / "journal.md"
+JOURNAL_DIR = SAM_HOME / "journal"
+# Pre-directory combined journal lives alongside the new directory and stays
+# greppable. Sam reads both `data/journal.md` and `data/journal/*.md`.
+LEGACY_JOURNAL_PATH = SAM_HOME / "journal.md"
 LOCK_PATH = SAM_HOME / "sam.lock"
 REPOS_DIR = SAM_HOME / "repos"
 CURSOR_PATH = SAM_HOME / "cursor.json"
+
+
+def journal_path_for_today() -> Path:
+    """Path to today's journal file. The directory is created if missing."""
+    JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    return JOURNAL_DIR / f"{datetime.now().date().isoformat()}.md"
 
 # How long without any stdout/stderr output before we consider Sam stuck
 STUCK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes
@@ -224,6 +233,7 @@ def _build_skill_catalog(skills_dir: Path) -> str:
         name = meta.get("name") or skill.stem
         desc = meta.get("description")
         when = meta.get("when_to_use") or meta.get("when to use")
+        cron_expr = meta.get("cron")
         if not desc:
             log.warning("skill %s missing 'description' in frontmatter", skill)
             desc = "(no description)"
@@ -231,6 +241,8 @@ def _build_skill_catalog(skills_dir: Path) -> str:
         line = f"- **{name}** — {desc}"
         if when:
             line += f"\n  *when to use:* {when}"
+        if cron_expr:
+            line += f"\n  *also scheduled by the daemon:* `{cron_expr}` (cron). When this fires you'll see a SCHEDULED SKILL invocation block at the top of your conversation."
         line += f"\n  *full content:* `Read {rel}`"
         entries.append(line)
     if not entries:
@@ -279,7 +291,10 @@ You are Sam, running as a Claude Code session. Each time you wake up, you
 are responding to a Slack message that came in via the daemon.
 
 Before responding, decide what context you need and go get it. Use:
-- The journal at `/data/journal.md` (grep, tail, head — your call)
+- The journal: one file per day at `/data/journal/<YYYY-MM-DD>.md`. Today's
+  file is where you'll write this session's entry. The pre-directory combined
+  journal is still at `/data/journal.md` (kept in place for grep continuity).
+  When looking back, grep across BOTH `/data/journal/` AND `/data/journal.md`.
 - The Linear API for issues and comments (`LINEAR_API_KEY` is in env)
 - The GitHub API and `gh` CLI for PRs, issues, code (`GITHUB_TOKEN` is in env)
 - The Slack Web API for posting back (`SLACK_BOT_TOKEN` is in env)
@@ -293,9 +308,15 @@ operator status are also included — use them verbatim in journal entries.
 Do NOT infer a sender's identity from the `<@U…>` mention alone; the
 daemon already resolved the name for you.
 
-Before you finish, append a journal entry describing what you did. Follow
-the format in `src/capabilities/journal.md`. This is how future-you
-remembers.
+If the start of your conversation is a "SCHEDULED SKILL invocation" block
+instead of a Slack message, the daemon's scheduler triggered a skill that
+has a `cron:` field in its frontmatter. Read the named skill file and
+follow it. Silence (post nothing) is an acceptable answer for scheduled
+wake-ups; only post when there's substance.
+
+Before you finish, append a journal entry to today's file at
+`/data/journal/<YYYY-MM-DD>.md`. Follow the format in
+`src/capabilities/journal.md`. This is how future-you remembers.
 
 Be honest, terse, and useful. Don't perform engagement. Don't explain what
 you're about to do unless someone is going to be watching the status
@@ -321,7 +342,7 @@ def _format_file_size(num_bytes: Optional[int]) -> str:
 
 @dataclass
 class IncomingMessage:
-    """A Slack message that woke Sam up."""
+    """A Slack message that woke Sam up — or a synthetic scheduled wake-up."""
     channel: str
     user: str
     text: str
@@ -331,6 +352,7 @@ class IncomingMessage:
     display_name: Optional[str] = None       # Slack display/real name, resolved by the daemon
     is_principal_operator: bool = False      # True iff `user` == SAM_OPERATOR_USER_ID
     retry_context: Optional[dict] = None  # Set on a one-shot retry session after a failed first attempt
+    scheduled: bool = False  # True when synthesised by the daemon's scheduler (not a real Slack message)
     raw_event: dict = field(repr=False, default_factory=dict)
 
     def _sender_label(self) -> str:
@@ -352,6 +374,8 @@ class IncomingMessage:
         """Format as the first user message into Sam's session."""
         if self.retry_context:
             return self._format_retry_message()
+        if self.scheduled:
+            return self._format_scheduled_message()
 
         thread_part = f"thread_ts={self.thread_ts}" if self.thread_ts else "no thread"
         body = (
@@ -376,6 +400,15 @@ class IncomingMessage:
             f"(use thread_ts={self.thread_ts or self.event_ts})."
         )
         return body
+
+    def _format_scheduled_message(self) -> str:
+        """Initial user message for a daemon-synthesised scheduled wake-up.
+
+        Distinct format so Sam doesn't try to reply to a non-existent
+        Slack message. The directive lives in self.text (set by the
+        scheduler from SCHEDULED_CHECKIN_PROMPT).
+        """
+        return self.text
 
     def _format_retry_message(self) -> str:
         """Initial user message for a one-shot retry after a failed session.
@@ -661,7 +694,7 @@ The triggering message was from <@{self.message.user}> in channel {self.message.
 The original request may be unaddressed. Future-Sam should check the Slack thread.
 
 """
-        with JOURNAL_PATH.open("a") as f:
+        with journal_path_for_today().open("a") as f:
             f.write(entry)
 
 # -----------------------------------------------------------------------------
@@ -769,8 +802,8 @@ class Daemon:
         thread (typing → "wait, actually…" → "and one more thing"), Sam
         should reply once to the combined set, not three times.
 
-        Retry messages never coalesce. Non-related queued messages are put
-        back on the queue in receive order.
+        Scheduled and retry messages never coalesce. Non-related queued
+        messages are put back on the queue in receive order.
 
         The returned IncomingMessage carries the first message's identity
         and thread_ts (so the reply targets the correct thread), the
@@ -779,7 +812,7 @@ class Daemon:
         a text body that labels each message with its source ts so Sam
         can refer to them individually.
         """
-        if first.retry_context:
+        if first.scheduled or first.retry_context:
             return first
         first_thread_key = (first.channel, first.thread_ts or first.event_ts)
         batch: list[IncomingMessage] = [first]
@@ -789,7 +822,11 @@ class Daemon:
                 other = self.queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            if other.retry_context or other.channel != first.channel:
+            if (
+                other.scheduled
+                or other.retry_context
+                or other.channel != first.channel
+            ):
                 keep.append(other)
                 continue
             other_thread_key = (other.channel, other.thread_ts or other.event_ts)
@@ -797,6 +834,7 @@ class Daemon:
                 batch.append(other)
             else:
                 keep.append(other)
+        # Put non-related messages back in the order we received them.
         for m in keep:
             self.queue.put_nowait(m)
         if len(batch) == 1:
@@ -1109,10 +1147,11 @@ class Daemon:
             except asyncio.TimeoutError:
                 continue
 
-            # Drain any other queued messages that belong to the same thread.
-            # If we find any, combine them into one IncomingMessage so Sam
-            # responds once to the whole batch rather than replying N times
-            # to N rapid follow-ups.
+            # Drain any other queued messages that belong to the same thread
+            # (or are top-level from the same user in the same channel within
+            # the queue at this moment). If we find any, combine them into one
+            # IncomingMessage so Sam responds once to the whole batch rather
+            # than replying N times to N rapid follow-ups.
             message = self._coalesce_thread_batch(message)
 
             async with self.session_lock:
@@ -1209,6 +1248,93 @@ class Daemon:
         except Exception:
             log.exception("operator alert post failed")
 
+    def _discover_cron_skills(self) -> list[tuple[str, str]]:
+        """Scan src/skills/*.md for skills with a `cron:` frontmatter field.
+
+        Returns a list of (skill_name, cron_expression) tuples. The skill
+        body lives at `src/skills/<name>.md`; the daemon doesn't read it —
+        sam reads it when the scheduled message fires.
+        """
+        skills_dir = SAM_SRC / "skills"
+        if not skills_dir.exists():
+            return []
+        found: list[tuple[str, str]] = []
+        for skill in sorted(skills_dir.glob("*.md")):
+            try:
+                meta, _ = _parse_frontmatter(skill.read_text())
+            except OSError:
+                log.exception("could not read skill %s", skill)
+                continue
+            cron_expr = meta.get("cron")
+            if not cron_expr:
+                continue
+            name = meta.get("name") or skill.stem
+            found.append((name, cron_expr))
+        return found
+
+    async def _run_cron_skill(self, skill_name: str, cron_expr: str) -> None:
+        """One async task per scheduled skill. Sleeps until each next fire."""
+        try:
+            from croniter import croniter
+        except ImportError:
+            log.error(
+                "croniter not installed; cannot schedule skill %s. "
+                "Add `croniter` to src/runtime/requirements.txt and rebuild.",
+                skill_name,
+            )
+            return
+        if not SAM_CHANNEL:
+            log.info("scheduled skill %s: disabled (SAM_CHANNEL unset)", skill_name)
+            return
+        try:
+            iterator = croniter(cron_expr, datetime.now().astimezone())
+        except (ValueError, KeyError):
+            log.exception("invalid cron expression %r for skill %s", cron_expr, skill_name)
+            return
+
+        while not self.shutdown_event.is_set():
+            next_fire: datetime = iterator.get_next(datetime)
+            now = datetime.now().astimezone()
+            sleep_seconds = max(0.0, (next_fire - now).total_seconds())
+            log.info(
+                "scheduled skill %s: next fire at %s (in %ds)",
+                skill_name, next_fire.isoformat(), int(sleep_seconds),
+            )
+            try:
+                await asyncio.wait_for(self.shutdown_event.wait(), timeout=sleep_seconds)
+                return  # shutdown signalled
+            except asyncio.TimeoutError:
+                pass  # woke up
+            await self._enqueue_scheduled_skill(skill_name)
+
+    async def _enqueue_scheduled_skill(self, skill_name: str) -> None:
+        ts = f"{time.time():.6f}"
+        today_journal = f"/data/journal/{datetime.now().date().isoformat()}.md"
+        text = (
+            f"This is a SCHEDULED SKILL invocation — not a Slack message. "
+            f"The daemon's scheduler triggered `{skill_name}`. "
+            f"Read `src/skills/{skill_name}.md` for the full directive, then follow it.\n\n"
+            f"BEFORE running the full directive: grep today's journal file "
+            f"({today_journal}) for past fires of `{skill_name}`. If past-you "
+            f"already ran it today, your job here is a delta check — what changed "
+            f"since the previous fire? — not a full re-run. If past-you only got "
+            f"partway, pick up where it stopped. If today's file has no prior fire, "
+            f"this is the first run and you do the whole directive.\n\n"
+            f"Target channel for any Slack post: {SAM_CHANNEL}. "
+            f"Silence is acceptable — only post when there's substance."
+        )
+        message = IncomingMessage(
+            channel=SAM_CHANNEL,
+            user=self.bot_user_id or "scheduler",
+            text=text,
+            thread_ts=None,
+            event_ts=ts,
+            scheduled=True,
+            raw_event={},
+        )
+        log.info("scheduled skill %s: queuing (event_ts=%s)", skill_name, ts)
+        await self.queue.put(message)
+
     async def run(self) -> None:
         # Identify ourselves so we can recognize and skip our own messages.
         try:
@@ -1234,15 +1360,26 @@ class Daemon:
         # but don't block startup on it — it can be slow if many threads.
         catchup_task = asyncio.create_task(self._catch_up())
 
+        # One async task per scheduled skill (skills with a `cron:` frontmatter
+        # field). Discovered at startup; changes require a daemon restart.
+        cron_tasks: list[asyncio.Task] = []
+        for skill_name, cron_expr in self._discover_cron_skills():
+            log.info("registering scheduled skill: %s (cron=%s)", skill_name, cron_expr)
+            cron_tasks.append(asyncio.create_task(self._run_cron_skill(skill_name, cron_expr)))
+        if not cron_tasks:
+            log.info("no skills with `cron:` frontmatter; no scheduled tasks running")
+
         log.info("Sam daemon ready (channel=%s)", SAM_CHANNEL or "all")
 
         await self.shutdown_event.wait()
 
         log.info("shutting down")
+        for t in cron_tasks:
+            t.cancel()
         catchup_task.cancel()
         socket_task.cancel()
         worker_task.cancel()
-        for t in (catchup_task, socket_task, worker_task):
+        for t in (*cron_tasks, catchup_task, socket_task, worker_task):
             try:
                 await t
             except (asyncio.CancelledError, Exception):
