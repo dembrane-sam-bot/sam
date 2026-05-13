@@ -288,7 +288,10 @@ Before responding, decide what context you need and go get it. Use:
 
 The Slack message that triggered this session is at the start of your
 conversation. The channel ID and thread timestamp are included so you can
-post back in the right place.
+post back in the right place. The sender's display name and principal-
+operator status are also included — use them verbatim in journal entries.
+Do NOT infer a sender's identity from the `<@U…>` mention alone; the
+daemon already resolved the name for you.
 
 Before you finish, append a journal entry describing what you did. Follow
 the format in `src/capabilities/journal.md`. This is how future-you
@@ -325,8 +328,25 @@ class IncomingMessage:
     thread_ts: Optional[str]  # If part of a thread; else None
     event_ts: str
     files: list[dict] = field(default_factory=list)
+    display_name: Optional[str] = None       # Slack display/real name, resolved by the daemon
+    is_principal_operator: bool = False      # True iff `user` == SAM_OPERATOR_USER_ID
     retry_context: Optional[dict] = None  # Set on a one-shot retry session after a failed first attempt
     raw_event: dict = field(repr=False, default_factory=dict)
+
+    def _sender_label(self) -> str:
+        """Human-readable sender reference for the initial user message.
+
+        Includes the resolved display name when the daemon was able to look
+        it up, and explicitly flags principal-operator status so Sam can't
+        infer-and-mislabel.
+        """
+        name_part = f"{self.display_name} " if self.display_name else ""
+        principal_part = (
+            "the principal operator"
+            if self.is_principal_operator
+            else "NOT the principal operator"
+        )
+        return f"{name_part}(<@{self.user}>, {principal_part})"
 
     def to_initial_user_message(self) -> str:
         """Format as the first user message into Sam's session."""
@@ -335,7 +355,7 @@ class IncomingMessage:
 
         thread_part = f"thread_ts={self.thread_ts}" if self.thread_ts else "no thread"
         body = (
-            f"Slack message in channel {self.channel} from <@{self.user}> ({thread_part}):\n\n"
+            f"Slack message in channel {self.channel} from {self._sender_label()} ({thread_part}):\n\n"
             f"{self.text}\n\n"
         )
         if self.files:
@@ -383,7 +403,7 @@ class IncomingMessage:
             "3. Then stop. This is a one-shot. The daemon will not retry again.",
             "",
             "## What the previous session was trying to handle",
-            f"From <@{self.user}> in channel {self.channel} ({thread_part}):",
+            f"From {self._sender_label()} in channel {self.channel} ({thread_part}):",
             "",
             self.text,
         ]
@@ -666,6 +686,9 @@ class Daemon:
         # Channel ids seen via assistant_thread_started; used as a fallback to
         # detect side-pane messages that don't carry an `assistant_thread` field.
         self._assistant_thread_channels: set[str] = set()
+        # In-memory cache: slack user_id -> (display_name, is_principal_operator)
+        # Cleared on daemon restart; display names rarely change so this is fine.
+        self._user_cache: dict[str, tuple[str, bool]] = {}
 
         self._register_handlers()
 
@@ -706,6 +729,38 @@ class Daemon:
         if event.get("assistant_thread"):
             return True
         return bool(channel and channel in self._assistant_thread_channels)
+
+    async def _resolve_user(self, user_id: str) -> tuple[str, bool]:
+        """Return (display_name, is_principal_operator) for a Slack user id.
+
+        Hits `users.info` once per user_id and caches in-memory for the
+        process lifetime. Falls back to the raw user_id as the display name
+        if the API call fails — the daemon never blocks queuing on a
+        resolution failure, since `is_principal_operator` is still
+        computable from env regardless.
+        """
+        cached = self._user_cache.get(user_id)
+        if cached is not None:
+            return cached
+        display_name = user_id
+        try:
+            resp = await self.app.client.users_info(user=user_id)
+        except Exception:
+            log.exception("users.info failed for %s; falling back to id", user_id)
+            resp = None
+        if resp:
+            u = resp.get("user") or {}
+            profile = u.get("profile") or {}
+            display_name = (
+                profile.get("display_name")
+                or profile.get("real_name")
+                or u.get("name")
+                or user_id
+            )
+        is_principal = bool(SAM_OPERATOR_USER_ID) and user_id == SAM_OPERATOR_USER_ID
+        resolved = (display_name, is_principal)
+        self._user_cache[user_id] = resolved
+        return resolved
 
     async def _bot_participates_in_thread(self, channel: str, thread_ts: str) -> bool:
         """Has the bot ever posted in this thread?
@@ -850,6 +905,8 @@ class Daemon:
         if not user:
             return
 
+        display_name, is_principal = await self._resolve_user(user)
+
         files = event.get("files") or []
         message = IncomingMessage(
             channel=channel,
@@ -858,6 +915,8 @@ class Daemon:
             thread_ts=event.get("thread_ts"),
             event_ts=ts,
             files=files,
+            display_name=display_name,
+            is_principal_operator=is_principal,
             raw_event=event,
         )
         # Pre-warm the thread-participation cache so subsequent replies in
@@ -871,8 +930,10 @@ class Daemon:
         asyncio.create_task(self._post_eyes_reaction(channel, ts))
         await self.queue.put(message)
         attachment_note = f" with {len(files)} attachment(s)" if files else ""
-        log.info("queued message from <@%s> in %s (ts=%s)%s",
-                 message.user, message.channel, message.event_ts, attachment_note)
+        principal_note = " [principal]" if message.is_principal_operator else ""
+        log.info("queued message from %s (<@%s>)%s in %s (ts=%s)%s",
+                 message.display_name or "?", message.user, principal_note,
+                 message.channel, message.event_ts, attachment_note)
 
     async def _catch_up(self) -> None:
         """Replay messages missed while the daemon was offline.
@@ -1008,6 +1069,8 @@ class Daemon:
                     thread_ts=message.thread_ts,
                     event_ts=message.event_ts,
                     files=message.files,
+                    display_name=message.display_name,
+                    is_principal_operator=message.is_principal_operator,
                     retry_context={
                         "exit_code": first_result.exit_code,
                         "stuck": first_result.stuck,
