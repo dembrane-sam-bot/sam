@@ -762,6 +762,75 @@ class Daemon:
         self._user_cache[user_id] = resolved
         return resolved
 
+    def _coalesce_thread_batch(self, first: IncomingMessage) -> IncomingMessage:
+        """Drain queue siblings in the same thread and merge into one prompt.
+
+        Goal: when a user sends two or three rapid follow-ups in the same
+        thread (typing → "wait, actually…" → "and one more thing"), Sam
+        should reply once to the combined set, not three times.
+
+        Retry messages never coalesce. Non-related queued messages are put
+        back on the queue in receive order.
+
+        The returned IncomingMessage carries the first message's identity
+        and thread_ts (so the reply targets the correct thread), the
+        latest message's event_ts (so any top-level reply lands at the
+        most recent message), files concatenated across the batch, and
+        a text body that labels each message with its source ts so Sam
+        can refer to them individually.
+        """
+        if first.retry_context:
+            return first
+        first_thread_key = (first.channel, first.thread_ts or first.event_ts)
+        batch: list[IncomingMessage] = [first]
+        keep: list[IncomingMessage] = []
+        while True:
+            try:
+                other = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if other.retry_context or other.channel != first.channel:
+                keep.append(other)
+                continue
+            other_thread_key = (other.channel, other.thread_ts or other.event_ts)
+            if other_thread_key == first_thread_key:
+                batch.append(other)
+            else:
+                keep.append(other)
+        for m in keep:
+            self.queue.put_nowait(m)
+        if len(batch) == 1:
+            return first
+        log.info(
+            "coalesced %d messages in thread (channel=%s thread_ts=%s)",
+            len(batch), first.channel, first.thread_ts or first.event_ts,
+        )
+        parts: list[str] = [
+            (
+                f"The user sent {len(batch)} messages in rapid succession in this thread. "
+                "Read them together and respond ONCE — don't reply to each one separately."
+            ),
+            "",
+        ]
+        for i, m in enumerate(batch, 1):
+            parts.append(f"--- message {i}/{len(batch)} (ts={m.event_ts}) ---")
+            parts.append(m.text or "(no text)")
+            parts.append("")
+        merged_files: list[dict] = []
+        for m in batch:
+            merged_files.extend(m.files)
+        return IncomingMessage(
+            channel=first.channel,
+            user=first.user,
+            text="\n".join(parts).rstrip(),
+            thread_ts=first.thread_ts,
+            event_ts=batch[-1].event_ts,
+            files=merged_files,
+            display_name=first.display_name,
+            is_principal_operator=first.is_principal_operator,
+            raw_event=first.raw_event,
+        )
+
     async def _bot_participates_in_thread(self, channel: str, thread_ts: str) -> bool:
         """Has the bot ever posted in this thread?
 
@@ -1039,6 +1108,12 @@ class Daemon:
                 message = await asyncio.wait_for(self.queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
+
+            # Drain any other queued messages that belong to the same thread.
+            # If we find any, combine them into one IncomingMessage so Sam
+            # responds once to the whole batch rather than replying N times
+            # to N rapid follow-ups.
+            message = self._coalesce_thread_batch(message)
 
             async with self.session_lock:
                 # Set a placeholder status before the session starts so the
