@@ -2,7 +2,7 @@
 
 The journal is Sam's long-term memory.
 
-It lives at `/data/journal.md` — a single append-only markdown file. It survives container restarts, image rebuilds, and reproductions of Sam onto new boxes. Sessions are ephemeral; the journal is not.
+Primary journal storage is `/data/journal/<YYYY-MM-DD>.md` (one file per day). Legacy combined history remains at `/data/journal.md` for continuity and grep. Sessions are ephemeral; journal files are not.
 
 ## What the journal is for
 
@@ -48,7 +48,7 @@ When Sam wakes up to a Slack message, Sam decides what context is needed. Common
 
 Sam doesn't load the whole journal into context. The journal grows; the context window doesn't.
 
-Sam uses `grep`, `tail`, or just `head -n` on the journal as appropriate. Standard file tools.
+When looking back, Sam should check both `/data/journal/` and `/data/journal.md` during the migration window. Use `grep`, `tail`, or `head` as appropriate.
 
 ## What goes in, what doesn't
 

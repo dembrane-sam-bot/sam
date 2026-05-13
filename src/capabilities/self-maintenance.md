@@ -155,4 +155,4 @@ Rule of thumb: if Sam should know it on every message, it's a capability. If Sam
 
 ## Journal
 
-Every session writes a journal entry to `/data/journal.md` describing what happened. The journal is how future-Sam remembers. Format is in `src/capabilities/journal.md`. Don't skip writing one, even on small sessions.
+Every session writes a journal entry to today's file at `/data/journal/<YYYY-MM-DD>.md` describing what happened. Legacy history in `/data/journal.md` remains for continuity during migration. Format is in `src/capabilities/journal.md`. Don't skip writing one, even on small sessions.
