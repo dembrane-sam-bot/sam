@@ -261,16 +261,19 @@ class Daemon:
     async def _add_session_reactions(
         self, message: IncomingMessage, result: SessionResult,
     ) -> None:
-        """Add :brain: / :gear: reactions to Sam's most recent post.
+        """Add lifecycle reactions to Sam's most recent post.
 
-        Lifecycle complement to :eyes: (added on inbound messages at queue time):
-        - :brain: when the session dispatched the opus subagent.
-        - :gear: when the session did any non-Slack-housekeeping tool work.
+        Complement to :eyes: (added on inbound messages at queue time). Three
+        independent signals — any combination can fire:
+        - :brain:                 when the session dispatched the opus subagent.
+        - :globe_with_meridians:  when the session used WebFetch or WebSearch.
+        - :gear:                  when the session did side-effect tool work
+                                  beyond chatting and journaling.
 
         Skip on failed sessions — the post (if any) might be partial garbage.
-        Skip if neither flag is set — nothing to mark.
+        Skip if no flag is set — nothing to mark.
         """
-        if result.failed or not (result.opus_used or result.tools_used):
+        if result.failed or not (result.opus_used or result.web_used or result.tools_used):
             return
         if not self.bot_user_id:
             return
@@ -310,6 +313,8 @@ class Daemon:
         reactions: list[str] = []
         if result.opus_used:
             reactions.append("brain")
+        if result.web_used:
+            reactions.append("globe_with_meridians")
         if result.tools_used:
             reactions.append("gear")
         for name in reactions:
