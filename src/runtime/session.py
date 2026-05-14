@@ -403,9 +403,10 @@ class SessionResult:
 
     Reaction flags are independent — any combination can fire on a given
     session:
-    - opus_used  → :brain:
-    - web_used   → :globe_with_meridians:
-    - tools_used → :gear:
+    - opus_used     → :brain:
+    - web_used      → :globe_with_meridians:
+    - bash_used     → :computer:
+    - edited_files  → :gear:
     """
     session_id: str
     started_at: float
@@ -417,7 +418,8 @@ class SessionResult:
     timed_out: bool
     opus_used: bool = False       # Agent tool dispatched to opus
     web_used: bool = False        # WebFetch or WebSearch was used
-    tools_used: bool = False      # Sam took side-effect action beyond chatting + journaling
+    bash_used: bool = False       # Bash used for non-Slack-housekeeping work (git, gh, curl, etc.)
+    edited_files: bool = False    # Edit/Write to a path outside /data/journal/
     stderr_tail: list[str] = field(default_factory=list)
     synthetic_errors: list[str] = field(default_factory=list)
 
@@ -472,7 +474,7 @@ class SamSession:
             agent_result.stuck, agent_result.timed_out,
         )
 
-        opus_used, web_used, tools_used = self._classify_tool_use(
+        opus_used, web_used, bash_used, edited_files = self._classify_tool_use(
             agent_result.tool_use_records,
         )
 
@@ -487,7 +489,8 @@ class SamSession:
             timed_out=agent_result.timed_out,
             opus_used=opus_used,
             web_used=web_used,
-            tools_used=tools_used,
+            bash_used=bash_used,
+            edited_files=edited_files,
             stderr_tail=agent_result.stderr_tail,
             synthetic_errors=agent_result.synthetic_errors,
         )
@@ -500,29 +503,33 @@ class SamSession:
         return result
 
     @staticmethod
-    def _classify_tool_use(records: list[ToolUseRecord]) -> tuple[bool, bool, bool]:
-        """Return (opus_used, web_used, tools_used) for the post-session reactions.
+    def _classify_tool_use(
+        records: list[ToolUseRecord],
+    ) -> tuple[bool, bool, bool, bool]:
+        """Return (opus_used, web_used, bash_used, edited_files) for the
+        post-session badges.
 
-        - opus_used  = Agent tool dispatched to subagent_type=opus.
-        - web_used   = WebFetch or WebSearch was used.
-        - tools_used = Sam took action with a side effect beyond chatting and
-          writing today's journal entry. Read-only tools (Read, Grep, Glob)
-          and routine journal Edit/Write under /data/journal/ don't count —
-          they happen on essentially every session, so they'd make :gear:
-          meaningless. Edit/Write outside the journal, Bash that isn't Slack
-          housekeeping, and Agent dispatch all count.
+        - opus_used    = Agent tool dispatched to subagent_type=opus.
+        - web_used     = WebFetch or WebSearch was used.
+        - bash_used    = Bash used for non-Slack-housekeeping work (Bash
+          calls whose command contains "slack.com" are post/react/reply
+          calls and don't count).
+        - edited_files = Edit or Write touched a path outside `/data/journal/`.
+          Routine journal entries are written by every session and would
+          make this flag meaningless if they counted.
 
-        Each flag drives an independent reaction emoji; any combination can
-        fire on a given session.
+        Read-only tools (Read, Grep, Glob) are pure context-gathering and
+        don't drive any badge. Each flag drives one independent emoji on
+        Sam's response; any combination can fire on a given session.
         """
         opus_used = False
         web_used = False
-        tools_used = False
+        bash_used = False
+        edited_files = False
         for record in records:
             name = record.name
             input_dict = record.input or {}
             if name == "Agent":
-                tools_used = True
                 if input_dict.get("subagent_type") == "opus":
                     opus_used = True
             elif name in ("WebFetch", "WebSearch"):
@@ -530,13 +537,13 @@ class SamSession:
             elif name == "Bash":
                 command = input_dict.get("command") or ""
                 if "slack.com" not in command:
-                    tools_used = True
+                    bash_used = True
             elif name in ("Edit", "Write"):
                 file_path = input_dict.get("file_path") or ""
                 if not file_path.startswith("/data/journal/"):
-                    tools_used = True
+                    edited_files = True
             # Read, Grep, Glob: read-only context gathering, doesn't count.
-        return opus_used, web_used, tools_used
+        return opus_used, web_used, bash_used, edited_files
 
     def _safety_net_journal_entry(self, result: SessionResult) -> None:
         """Append a minimal journal entry when something went wrong.

@@ -61,6 +61,29 @@ from .session import IncomingMessage, SamSession, SessionResult
 
 
 # -----------------------------------------------------------------------------
+# Session badges — emoji footer appended to Sam's response
+# -----------------------------------------------------------------------------
+
+def _format_session_badges(result: SessionResult) -> str:
+    """Compose the one-line emoji footer from a SessionResult's flags.
+
+    Returns an empty string when no flag is set, so callers can short-circuit
+    without posting anything. Order is fixed (brain · globe · computer · gear)
+    so the footer reads consistently regardless of which combination fires.
+    """
+    parts: list[str] = []
+    if result.opus_used:
+        parts.append(":brain:")
+    if result.web_used:
+        parts.append(":globe_with_meridians:")
+    if result.bash_used:
+        parts.append(":computer:")
+    if result.edited_files:
+        parts.append(":gear:")
+    return " ".join(parts)
+
+
+# -----------------------------------------------------------------------------
 # Daemon — Slack listener + session queue
 # -----------------------------------------------------------------------------
 
@@ -258,27 +281,36 @@ class Daemon:
         self._thread_cache[key] = (participates, time.monotonic())
         return participates
 
-    async def _add_session_reactions(
+    async def _append_session_badges(
         self, message: IncomingMessage, result: SessionResult,
     ) -> None:
-        """Add lifecycle reactions to Sam's most recent post.
+        """Append a one-line emoji badges footer to Sam's most recent post.
 
-        Complement to :eyes: (added on inbound messages at queue time). Three
-        independent signals — any combination can fire:
-        - :brain:                 when the session dispatched the opus subagent.
-        - :globe_with_meridians:  when the session used WebFetch or WebSearch.
-        - :gear:                  when the session did side-effect tool work
-                                  beyond chatting and journaling.
+        Complement to :eyes: (added as a reaction on inbound messages at
+        queue time). Four independent signals — any combination can fire:
+        - :brain:                 opus subagent was dispatched
+        - :globe_with_meridians:  WebFetch or WebSearch was used
+        - :computer:              Bash was used for non-Slack-housekeeping work
+        - :gear:                  Edit or Write touched a non-journal path
+
+        Implementation: find Sam's most recent post in the relevant thread (or
+        channel for scheduled wake-ups), fetch its current text, and call
+        chat.update with the badges appended on a new line. The bot retains
+        edit rights on its own messages, so this works without extra scope.
+        Slack will show a small "(edited)" indicator next to the message —
+        an accepted cost of the in-message-text approach.
 
         Skip on failed sessions — the post (if any) might be partial garbage.
         Skip if no flag is set — nothing to mark.
         """
-        if result.failed or not (result.opus_used or result.web_used or result.tools_used):
+        if result.failed:
+            return
+        badges = _format_session_badges(result)
+        if not badges:
             return
         if not self.bot_user_id:
             return
         oldest = f"{result.started_at_wall:.6f}"
-        target_ts: Optional[str] = None
         try:
             if message.scheduled or not (message.thread_ts or message.event_ts):
                 resp = await self.app.client.conversations_history(
@@ -291,39 +323,37 @@ class Daemon:
                     oldest=oldest, inclusive=False, limit=100,
                 )
         except Exception:
-            log.exception("could not fetch messages for reaction-adding")
+            log.exception("could not fetch messages for badge appending")
             return
         # Walk newest-first to find Sam's latest post. conversations_history
         # returns newest-first; conversations_replies returns oldest-first.
         # Try both directions to be safe.
         msgs = resp.get("messages", []) or []
+        target = None
         for m in reversed(msgs):
             if m.get("user") == self.bot_user_id or m.get("bot_id"):
-                target_ts = m.get("ts")
-                if target_ts:
-                    break
-        if not target_ts:
+                target = m
+                break
+        if target is None:
             for m in msgs:
                 if m.get("user") == self.bot_user_id or m.get("bot_id"):
-                    target_ts = m.get("ts")
-                    if target_ts:
-                        break
-        if not target_ts:
+                    target = m
+                    break
+        if target is None or not target.get("ts"):
             return
-        reactions: list[str] = []
-        if result.opus_used:
-            reactions.append("brain")
-        if result.web_used:
-            reactions.append("globe_with_meridians")
-        if result.tools_used:
-            reactions.append("gear")
-        for name in reactions:
-            try:
-                await self.app.client.reactions_add(
-                    channel=message.channel, timestamp=target_ts, name=name,
-                )
-            except Exception as e:
-                log.debug("reactions.add %s failed on %s: %s", name, target_ts, e)
+        original_text = target.get("text") or ""
+        # Avoid double-appending if a previous run already added a badge line.
+        if "\n\n" + badges in original_text or original_text.endswith(badges):
+            return
+        new_text = f"{original_text}\n\n{badges}" if original_text else badges
+        try:
+            await self.app.client.chat_update(
+                channel=message.channel,
+                ts=target["ts"],
+                text=new_text,
+            )
+        except Exception as e:
+            log.debug("chat.update for badges failed on %s: %s", target.get("ts"), e)
 
     async def _post_eyes_reaction(self, channel: str, ts: str) -> None:
         """Add :eyes: to the inbound message so the user knows it landed.
@@ -601,7 +631,7 @@ class Daemon:
 
                 if first_result is None or not first_result.failed:
                     if first_result is not None:
-                        await self._add_session_reactions(message, first_result)
+                        await self._append_session_badges(message, first_result)
                     continue
 
                 log.info(
@@ -640,7 +670,7 @@ class Daemon:
                     )
                     await self._post_operator_alert(message, first_result, retry_result)
                 else:
-                    await self._add_session_reactions(retry_message, retry_result)
+                    await self._append_session_badges(retry_message, retry_result)
 
     async def _post_operator_alert(
         self,
