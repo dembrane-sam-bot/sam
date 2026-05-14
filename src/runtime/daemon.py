@@ -1,803 +1,71 @@
-"""
-Sam's runtime daemon.
+"""Sam's Slack-event daemon.
 
 Responsibilities:
 - Listen for Slack events (Socket Mode, Agents & AI Apps surface)
-- For each incoming message that wakes Sam up, launch a Claude Code session
-- Stream Sam's output back to Slack as it arrives
+- For each incoming message that wakes Sam up, run a SamSession
+- Stream Sam's output back to Slack as it arrives (delegated to SamSession's
+  AgentRunner — the daemon doesn't read stream-json itself)
 - Route in-thread replies by asking Slack whether Sam has posted in the thread
   (no local thread bookkeeping; cached in-memory only)
 - Redirect messages received in the Agents & AI Apps side-pane back to the
   whitelisted channel
 - On startup, replay messages missed while the daemon was offline
 - Maintain a single-instance lock and a journal safety net
-- Detect stuck sessions and clean them up
+- Add lifecycle reactions (:eyes: ack, :brain:/:gear: post-session) to Slack messages
 
 What this daemon does NOT do:
-- Reason about anything. All reasoning happens inside Sam (the Claude Code session).
+- Reason about anything. All reasoning happens inside Sam (the agent session).
 - Talk to GitHub, Linear, or any external API except Slack. Sam does that itself.
-- Modify Sam's source. The daemon is tier-3 substrate; Sam doesn't touch it either.
+- Modify Sam's source. The daemon is Tier 3 substrate; Sam doesn't touch it either.
+
+Code layout:
+- src/runtime/config.py — env vars, paths, constants, redaction, lock, cursor, journal
+- src/runtime/prompts.py — system-prompt assembly and named situational templates
+- src/runtime/session.py — IncomingMessage, AgentRunner abstraction, SamSession
+- src/runtime/daemon.py — this file: Daemon class + entrypoint
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import logging
-import os
 import signal
-import subprocess
 import sys
 import time
-import uuid
-from collections import deque
-from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
-
-load_dotenv()
-
-SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-SAM_CHANNEL = os.environ.get("SAM_CHANNEL")  # optional: restrict to one channel for v0
-SAM_OPERATOR_USER_ID = os.environ.get("SAM_OPERATOR_USER_ID")  # @-mentioned when both attempts fail
-SAM_HOME = Path(os.environ.get("SAM_HOME", "/data"))
-SAM_REPO = Path("/home/sam")          # where Sam's checkout lives in the container
-SAM_SRC = SAM_REPO / "src"            # identity, scope, capabilities, skills, runtime
-SAM_CLAUDE_DIR = SAM_REPO / ".claude" # where Claude Code looks for project-level config
-
-# Default model for Sam's main session. Sam dispatches to the opus subagent
-# (see src/runtime/agents/opus.md) when it wants deeper reasoning.
-SAM_MODEL = "sonnet"
-
-JOURNAL_DIR = SAM_HOME / "journal"
-# Pre-directory combined journal lives alongside the new directory and stays
-# greppable. Sam reads both `data/journal.md` and `data/journal/*.md`.
-LEGACY_JOURNAL_PATH = SAM_HOME / "journal.md"
-LOCK_PATH = SAM_HOME / "sam.lock"
-REPOS_DIR = SAM_HOME / "repos"
-CURSOR_PATH = SAM_HOME / "cursor.json"
-
-
-def journal_path_for_today() -> Path:
-    """Path to today's journal file. The directory is created if missing."""
-    JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
-    return JOURNAL_DIR / f"{datetime.now().date().isoformat()}.md"
-
-
-def _read_commit_sha() -> Optional[str]:
-    """Return the short commit SHA of the source the daemon is running from.
-
-    Read once at module import. Stable for the process lifetime — the
-    container is rebuilt to pick up new code, so the SHA doesn't shift
-    mid-run. Returns None if `git` isn't available or the working tree
-    isn't a git checkout (e.g. running outside docker for tests).
-    """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=2, cwd=str(SAM_REPO),
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return None
-    if result.returncode != 0:
-        return None
-    return (result.stdout or "").strip() or None
-
-
-COMMIT_SHA: Optional[str] = _read_commit_sha()
-
-
-def provision_subagents() -> None:
-    """Copy Tier 3 subagent definitions into the place Claude Code looks for them.
-
-    Subagent definitions live under `src/runtime/agents/` (Tier 3 — substrate,
-    not Sam-editable). Claude Code only auto-discovers agents under
-    `.claude/agents/`, so on each daemon start we mirror the substrate copies
-    into that runtime path. If a teammate (or Sam itself, accidentally)
-    overwrote one of those files between restarts, this restores it.
-    """
-    source_dir = SAM_SRC / "runtime" / "agents"
-    if not source_dir.exists():
-        return
-    target_dir = SAM_CLAUDE_DIR / "agents"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for src in sorted(source_dir.glob("*.md")):
-        dst = target_dir / src.name
-        try:
-            dst.write_text(src.read_text())
-            log.info("provisioned subagent: %s", dst)
-        except OSError:
-            log.exception("could not provision subagent %s", src)
-
-
-# How long without any stdout/stderr output before we consider Sam stuck
-STUCK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes
-# Hard cap on a single session's wall clock
-MAX_SESSION_SECONDS = 60 * 60     # 1 hour
-# How long to cache "has the bot posted in this thread?" lookups
-THREAD_CACHE_TTL_SECONDS = 5 * 60
-# How many stderr lines we keep per session, to feed to a retry session on failure
-STDERR_TAIL_LINES = 40
-# How many synthetic-error messages we keep per session (Claude Code surfaces
-# API errors and similar internal failures as assistant messages with
-# `model: "<synthetic>"`. We capture them to brief retry sessions.)
-SYNTHETIC_ERRORS_MAX = 10
-# Subtypes accepted as real user messages
-ALLOWED_MESSAGE_SUBTYPES = {None, "thread_broadcast", "file_share"}
-# Subtypes we explicitly log-and-drop so they're visible in debugging
-NOISY_MESSAGE_SUBTYPES = {"message_changed", "message_deleted", "bot_message"}
-
-# Secret-redaction: minimum env value length to consider for redaction.
-# Short values produce too many false positives in normal text
-# (e.g. TZ=Europe/Amsterdam, SAM_HOME=/data, country codes).
-REDACT_MIN_LEN = 8
-REDACT_PLACEHOLDER = "xxxx"
-
-# -----------------------------------------------------------------------------
-# Secret redaction — defense-in-depth for anything the daemon posts to Slack
-# -----------------------------------------------------------------------------
-
-def _build_redaction_values() -> list[str]:
-    """Collect env var values worth scrubbing from outbound Slack content.
-
-    Skips values shorter than `REDACT_MIN_LEN` (would clobber benign matches).
-    Sorted longest-first so a substring of a longer secret can't get partially
-    redacted before the longer secret is matched.
-    """
-    values = {v for v in os.environ.values() if v and len(v) >= REDACT_MIN_LEN}
-    return sorted(values, key=len, reverse=True)
-
-
-_REDACT_VALUES: list[str] = _build_redaction_values()
-
-
-def redact_secrets(text: Optional[str]) -> str:
-    """Replace any env var value found in `text` with the redaction placeholder.
-
-    Defense-in-depth for daemon-originated Slack posts. Sam should never put
-    a secret into a message in the first place; this catches it if Sam ever
-    does, before the bytes leave the process.
-
-    Built once at import from the live env. If the env changes after import,
-    the table is stale — acceptable, since the daemon's env doesn't change
-    at runtime.
-    """
-    if not text:
-        return text or ""
-    out = text
-    for v in _REDACT_VALUES:
-        if v in out:
-            out = out.replace(v, REDACT_PLACEHOLDER)
-    return out
-
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+from .config import (
+    ALLOWED_MESSAGE_SUBTYPES,
+    COMMIT_SHA,
+    LockError,
+    NOISY_MESSAGE_SUBTYPES,
+    SAM_CHANNEL,
+    SAM_MODEL,
+    SAM_OPERATOR_USER_ID,
+    SLACK_APP_TOKEN,
+    SLACK_BOT_TOKEN,
+    THREAD_CACHE_TTL_SECONDS,
+    acquire_lock,
+    load_cursor,
+    log,
+    provision_subagents,
+    redact_secrets,
+    release_lock,
+    save_cursor,
 )
-log = logging.getLogger("sam.daemon")
+from .prompts import OPERATOR_ALERT_TEMPLATE, SCHEDULED_SKILL_TEMPLATE
+from .session import IncomingMessage, SamSession, SessionResult
 
-# -----------------------------------------------------------------------------
-# Lock — single-instance enforcement
-# -----------------------------------------------------------------------------
-
-class LockError(Exception):
-    pass
-
-def acquire_lock() -> None:
-    """Acquire the daemon-level lock. Refuses to start a second daemon."""
-    if LOCK_PATH.exists():
-        try:
-            pid = int(LOCK_PATH.read_text().strip())
-        except (ValueError, OSError):
-            log.warning("lock file unreadable, treating as stale")
-            LOCK_PATH.unlink(missing_ok=True)
-        else:
-            if _pid_alive(pid):
-                raise LockError(f"another daemon is running (pid {pid})")
-            log.warning("stale lock from dead pid %s, cleaning up", pid)
-            LOCK_PATH.unlink(missing_ok=True)
-    SAM_HOME.mkdir(parents=True, exist_ok=True)
-    LOCK_PATH.write_text(str(os.getpid()))
-
-def release_lock() -> None:
-    LOCK_PATH.unlink(missing_ok=True)
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
-
-# -----------------------------------------------------------------------------
-# Cursor persistence (a single Slack ts — the high-water mark for catch-up)
-# -----------------------------------------------------------------------------
-
-def load_cursor() -> Optional[str]:
-    """Read the last-seen Slack ts from disk. None on first run."""
-    if not CURSOR_PATH.exists():
-        return None
-    try:
-        return json.loads(CURSOR_PATH.read_text()).get("last_seen_ts")
-    except (json.JSONDecodeError, OSError):
-        log.warning("cursor.json unreadable, treating as first run")
-        return None
-
-def save_cursor(ts: str) -> None:
-    SAM_HOME.mkdir(parents=True, exist_ok=True)
-    current = load_cursor()
-    # Only advance the cursor — never rewind it.
-    if current and float(ts) <= float(current):
-        return
-    CURSOR_PATH.write_text(json.dumps({"last_seen_ts": ts}))
-
-# -----------------------------------------------------------------------------
-# Prompt templates — content the daemon synthesises and hands to Sam sessions
-#
-# Kept at module top so daemon-authored prompt content is visibly grouped and
-# named, separate from the control flow that decides when each fires. The
-# system-prompt orchestration block lives separately at
-# `src/runtime/orchestration.md` because every session reads it; the templates
-# below are situational user-message content for specific wake-up types.
-# -----------------------------------------------------------------------------
-
-RETRY_SESSION_INTRO = (
-    "A previous Sam session attempting to respond to a Slack message FAILED.\n"
-    "Do not retry the original task. Your one job in this session is:\n"
-    "\n"
-    "1. Read the failure context below.\n"
-    "2. Post ONE reply in the original Slack thread (channel={channel}, "
-    "thread_ts={thread_target}) in your normal Slack voice. Name what failed "
-    "in human terms, name the likely cause, and suggest a concrete fix. "
-    "Don't dump stderr verbatim — read it, summarise it.\n"
-    "3. Then stop. This is a one-shot. The daemon will not retry again."
-)
-
-RETRY_SESSION_OUTRO = (
-    "Remember: post ONCE, in the original thread, in your Slack voice. "
-    "Be honest about the failure. Suggest a fix if you can see one. "
-    "Prefer the synthetic errors above over stderr when identifying the cause. "
-    "Then exit."
-)
-
-SCHEDULED_SKILL_TEMPLATE = (
-    "This is a SCHEDULED SKILL invocation — not a Slack message. "
-    "The daemon's scheduler triggered `{skill_name}`. "
-    "Read `src/skills/{skill_name}.md` for the full directive, then follow it.\n\n"
-    "BEFORE running the full directive: grep today's journal file "
-    "({today_journal}) for past fires of `{skill_name}`. If past-you "
-    "already ran it today, your job here is a delta check — what changed "
-    "since the previous fire? — not a full re-run. If past-you only got "
-    "partway, pick up where it stopped. If today's file has no prior fire, "
-    "this is the first run and you do the whole directive.\n\n"
-    "Target channel for any Slack post: {channel}. "
-    "Silence is acceptable — only post when there's substance."
-)
-
-OPERATOR_ALERT_TEMPLATE = (
-    "{mention}something's wrong with me — i tried to respond and {first_status}, "
-    "then tried to explain what failed and that also {retry_status}. "
-    "need your eyes."
-)
-
-# -----------------------------------------------------------------------------
-# System prompt assembly
-# -----------------------------------------------------------------------------
-
-def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    """Parse simple YAML-ish frontmatter from the top of a markdown file.
-
-    Supports only single-line `key: value` pairs (no nested structures, no
-    multi-line scalars). Returns (metadata, body). If no frontmatter is
-    present, returns ({}, text).
-    """
-    if not text.startswith("---\n"):
-        return {}, text
-    end = text.find("\n---\n", 4)
-    if end == -1:
-        return {}, text
-    head = text[4:end]
-    body = text[end + len("\n---\n"):]
-    meta: dict[str, str] = {}
-    for line in head.splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        key, _, val = line.partition(":")
-        val = val.strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-            val = val[1:-1]
-        meta[key.strip()] = val
-    return meta, body
-
-
-def _build_skill_catalog(skills_dir: Path) -> str:
-    """Emit a frontmatter-only listing of skills.
-
-    Skills are NOT hot-loaded into the system prompt. The model sees only
-    name + description + when_to_use + path, and decides whether to Read
-    the full skill body when relevant.
-    """
-    entries: list[str] = []
-    for skill in sorted(skills_dir.glob("*.md")):
-        meta, _ = _parse_frontmatter(skill.read_text())
-        name = meta.get("name") or skill.stem
-        desc = meta.get("description")
-        when = meta.get("when_to_use") or meta.get("when to use")
-        cron_expr = meta.get("cron")
-        if not desc:
-            log.warning("skill %s missing 'description' in frontmatter", skill)
-            desc = "(no description)"
-        rel = skill.relative_to(SAM_REPO)
-        line = f"- **{name}** — {desc}"
-        if when:
-            line += f"\n  *when to use:* {when}"
-        if cron_expr:
-            line += f"\n  *also scheduled by the daemon:* `{cron_expr}` (cron). When this fires you'll see a SCHEDULED SKILL invocation block at the top of your conversation."
-        line += f"\n  *full content:* `Read {rel}`"
-        entries.append(line)
-    if not entries:
-        return ""
-    header = (
-        "# SKILLS (catalog only)\n\n"
-        "Skills are patterns Sam has learned. The listing below shows names "
-        "and descriptions; bodies are NOT included in this prompt. When a "
-        "skill matches your task, `Read` the listed path BEFORE applying it. "
-        "Don't guess what's in a skill — read it.\n"
-    )
-    return header + "\n" + "\n\n".join(entries)
-
-
-def assemble_system_prompt() -> str:
-    """Build the system prompt for a Claude Code session.
-
-    Hot-loads identity, scope, and capabilities (stable, always relevant).
-    Skills are catalog-only — model reads them on demand.
-
-    Re-read every session, so a `git pull` followed by next message picks up
-    the new version of Sam.
-    """
-    sections: list[str] = []
-
-    def _add(path: Path, header: str) -> None:
-        if path.exists():
-            sections.append(f"# {header}\n\n{path.read_text()}")
-
-    _add(SAM_SRC / "identity.md", "IDENTITY")
-    _add(SAM_SRC / "scope.md", "SCOPE")
-
-    for cap in sorted((SAM_SRC / "capabilities").glob("*.md")):
-        sections.append(f"# CAPABILITY: {cap.stem}\n\n{cap.read_text()}")
-
-    skills_dir = SAM_SRC / "skills"
-    if skills_dir.exists():
-        catalog = _build_skill_catalog(skills_dir)
-        if catalog:
-            sections.append(catalog)
-
-    orchestration_path = SAM_SRC / "runtime" / "orchestration.md"
-    if orchestration_path.exists():
-        sections.append(
-            orchestration_path.read_text().format(commit_sha=COMMIT_SHA or "unknown")
-        )
-
-    return "\n\n---\n\n".join(sections)
-
-# -----------------------------------------------------------------------------
-# Slack helpers
-# -----------------------------------------------------------------------------
-
-def _format_file_size(num_bytes: Optional[int]) -> str:
-    if not num_bytes:
-        return "unknown size"
-    for unit in ("B", "KB", "MB", "GB"):
-        if num_bytes < 1024 or unit == "GB":
-            return f"{num_bytes:.0f} {unit}" if unit == "B" else f"{num_bytes:.1f} {unit}"
-        num_bytes /= 1024
-    return f"{num_bytes:.1f} GB"
-
-
-@dataclass
-class IncomingMessage:
-    """A Slack message that woke Sam up — or a synthetic scheduled wake-up."""
-    channel: str
-    user: str
-    text: str
-    thread_ts: Optional[str]  # If part of a thread; else None
-    event_ts: str
-    files: list[dict] = field(default_factory=list)
-    display_name: Optional[str] = None       # Slack display/real name, resolved by the daemon
-    is_principal_operator: bool = False      # True iff `user` == SAM_OPERATOR_USER_ID
-    retry_context: Optional[dict] = None  # Set on a one-shot retry session after a failed first attempt
-    scheduled: bool = False  # True when synthesised by the daemon's scheduler (not a real Slack message)
-    raw_event: dict = field(repr=False, default_factory=dict)
-
-    def _sender_label(self) -> str:
-        """Human-readable sender reference for the initial user message.
-
-        Includes the resolved display name when the daemon was able to look
-        it up, and explicitly flags principal-operator status so Sam can't
-        infer-and-mislabel.
-        """
-        name_part = f"{self.display_name} " if self.display_name else ""
-        principal_part = (
-            "the principal operator"
-            if self.is_principal_operator
-            else "NOT the principal operator"
-        )
-        return f"{name_part}(<@{self.user}>, {principal_part})"
-
-    def to_initial_user_message(self) -> str:
-        """Format as the first user message into Sam's session."""
-        if self.retry_context:
-            return self._format_retry_message()
-        if self.scheduled:
-            return self._format_scheduled_message()
-
-        thread_part = f"thread_ts={self.thread_ts}" if self.thread_ts else "no thread"
-        body = (
-            f"Slack message in channel {self.channel} from {self._sender_label()} ({thread_part}):\n\n"
-            f"{self.text}\n\n"
-        )
-        if self.files:
-            lines = ["## Attached files\n"]
-            for f in self.files:
-                name = f.get("name") or f.get("id") or "<unnamed>"
-                mime = f.get("mimetype") or "unknown/unknown"
-                size = _format_file_size(f.get("size"))
-                url = f.get("url_private") or f.get("url_private_download") or ""
-                lines.append(f"- `{name}` ({mime}, {size}) — {url}")
-            lines.append(
-                "\nFetch only if the content is relevant to the task. "
-                "See `src/skills/slack-files.md` for the curl command and per-mimetype handling."
-            )
-            body += "\n".join(lines) + "\n\n"
-        body += (
-            f"Reply in Slack via the Web API. If this is in a thread, reply in-thread "
-            f"(use thread_ts={self.thread_ts or self.event_ts})."
-        )
-        return body
-
-    def _format_scheduled_message(self) -> str:
-        """Initial user message for a daemon-synthesised scheduled wake-up.
-
-        Distinct format so Sam doesn't try to reply to a non-existent
-        Slack message. The directive lives in self.text (set by the
-        scheduler from SCHEDULED_CHECKIN_PROMPT).
-        """
-        return self.text
-
-    def _format_retry_message(self) -> str:
-        """Initial user message for a one-shot retry after a failed session.
-
-        Tells Sam: don't redo the task. Read what went wrong, post a single
-        reply in the original thread explaining it, then exit.
-        """
-        ctx = self.retry_context or {}
-        thread_target = self.thread_ts or self.event_ts
-        thread_part = f"thread_ts={self.thread_ts}" if self.thread_ts else "no thread"
-
-        if ctx.get("stuck"):
-            failure_summary = "STUCK — no output for the stuck-detection window (the daemon killed the process)."
-        elif ctx.get("timed_out"):
-            failure_summary = "TIMED_OUT — exceeded the per-session wall-clock cap (the daemon killed the process)."
-        else:
-            failure_summary = f"Exited with non-zero code: {ctx.get('exit_code')}."
-
-        lines = [
-            RETRY_SESSION_INTRO.format(channel=self.channel, thread_target=thread_target),
-            "",
-            "## What the previous session was trying to handle",
-            f"From {self._sender_label()} in channel {self.channel} ({thread_part}):",
-            "",
-            self.text,
-        ]
-
-        if self.files:
-            lines.append("")
-            lines.append("Attached files (from the original message):")
-            for f in self.files:
-                name = f.get("name") or f.get("id") or "<unnamed>"
-                mime = f.get("mimetype") or "unknown/unknown"
-                size = _format_file_size(f.get("size"))
-                lines.append(f"- `{name}` ({mime}, {size})")
-
-        lines.append("")
-        lines.append("## Why the previous session failed")
-        lines.append(failure_summary)
-
-        synthetic_errors = ctx.get("synthetic_errors") or []
-        if synthetic_errors:
-            lines.append("")
-            lines.append(
-                "Synthetic error messages from Claude Code (these are the most "
-                "load-bearing signal — Claude Code surfaces API errors and other "
-                "internal failures here, NOT in stderr):"
-            )
-            lines.append("```")
-            for e in synthetic_errors:
-                lines.append(e)
-            lines.append("```")
-
-        stderr_tail = ctx.get("stderr_tail") or []
-        if stderr_tail:
-            lines.append("")
-            lines.append(
-                f"Stderr (last {len(stderr_tail)} lines from the failed session — "
-                "treat as secondary signal; warnings here are often noise that "
-                "appears in successful sessions too):"
-            )
-            lines.append("```")
-            for s in stderr_tail:
-                # Scrub env values — this stderr will be summarised back into Slack.
-                lines.append(redact_secrets(s))
-            lines.append("```")
-
-        lines.append("")
-        lines.append(RETRY_SESSION_OUTRO)
-        return "\n".join(lines)
-
-# -----------------------------------------------------------------------------
-# Sam session — one Claude Code subprocess per Slack interaction
-# -----------------------------------------------------------------------------
-
-@dataclass
-class SessionResult:
-    session_id: str
-    started_at: float
-    started_at_wall: float        # time.time() at subprocess launch — for Slack history queries
-    ended_at: float
-    exit_code: Optional[int]
-    last_output_at: float
-    stuck: bool
-    timed_out: bool
-    opus_used: bool = False       # Agent tool dispatched to opus during the session
-    tools_used: bool = False      # any tool_use that wasn't a Slack housekeeping Bash call
-    stderr_tail: list[str] = field(default_factory=list)
-    synthetic_errors: list[str] = field(default_factory=list)
-
-    @property
-    def failed(self) -> bool:
-        return self.stuck or self.timed_out or bool(self.exit_code)
-
-class SamSession:
-    """Runs one Claude Code session against one incoming message.
-
-    Reads identity/scope/capabilities/skills fresh, builds the system prompt,
-    pipes the Slack message in, lets Sam stream out, and watches for stuck.
-    """
-
-    def __init__(self, message: IncomingMessage):
-        self.message = message
-        self.session_id = uuid.uuid4().hex[:12]
-        self.proc: Optional[asyncio.subprocess.Process] = None
-        self.last_output_at = time.monotonic()
-        # Ring buffer of recent stderr — used to brief a retry session if this one fails
-        self.stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
-        # Synthetic error messages observed in stdout (claude code surfaces API
-        # errors, etc., as assistant messages with model="<synthetic>")
-        self.synthetic_errors: deque[str] = deque(maxlen=SYNTHETIC_ERRORS_MAX)
-        # Lifecycle flags surfaced as Slack reactions after the session ends.
-        # opus_used = the Agent tool dispatched to opus.
-        # tools_used = any tool_use happened that wasn't just Slack housekeeping
-        # (Bash with "slack.com" in the command — posts, reactions, replies).
-        self.opus_used: bool = False
-        self.tools_used: bool = False
-
-    async def run(self) -> SessionResult:
-        system_prompt = assemble_system_prompt()
-        initial_user_message = self.message.to_initial_user_message()
-
-        log.info(
-            "session %s starting (channel=%s thread_ts=%s)",
-            self.session_id, self.message.channel, self.message.thread_ts
-        )
-
-        started_at = time.monotonic()
-        # Wall-clock start, so the daemon can query Slack history for messages
-        # Sam posts during this session.
-        started_at_wall = time.time()
-
-        # Build the input the Claude CLI expects on stdin (stream-json input)
-        # Format: one JSON object per line, each being {type: "user", message: {role: "user", content: "..."}}
-        user_input = json.dumps({
-            "type": "user",
-            "message": {"role": "user", "content": initial_user_message}
-        }) + "\n"
-
-        env = os.environ.copy()
-        # Sam runs from its own home so relative paths in capability files work
-        cwd = str(SAM_REPO)
-
-        self.proc = await asyncio.create_subprocess_exec(
-            "claude",
-            "-p",                                  # print/non-interactive
-            "--verbose",                           # required by -p + stream-json output
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-            "--include-partial-messages",
-            "--model", SAM_MODEL,
-            "--system-prompt", system_prompt,
-            "--allowed-tools", "Bash,Read,Write,Edit,Grep,Glob,WebFetch,WebSearch,Agent",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=cwd,
-        )
-
-        # Send the user message and close stdin (Sam will respond and exit)
-        assert self.proc.stdin is not None
-        self.proc.stdin.write(user_input.encode())
-        await self.proc.stdin.drain()
-        self.proc.stdin.close()
-
-        # Run stdout reader, stderr reader, and stuck watcher concurrently
-        stuck = False
-        timed_out = False
-
-        async def read_stdout() -> None:
-            assert self.proc and self.proc.stdout
-            async for line in self.proc.stdout:
-                self.last_output_at = time.monotonic()
-                raw = line.decode().strip()
-                if not raw:
-                    continue
-                log.debug("stdout: %s", raw[:200])
-                # Stream-json: try to parse and extract synthetic error messages.
-                # These are claude code's way of surfacing API errors and similar
-                # internal failures — exactly the signal a retry session needs.
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") != "assistant":
-                    continue
-                msg = event.get("message") or {}
-                content_blocks = msg.get("content") or []
-                if msg.get("model") == "<synthetic>":
-                    for block in content_blocks:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = (block.get("text") or "").strip()
-                            if text:
-                                self.synthetic_errors.append(text[:1000])
-                                log.warning("synthetic error: %s", text[:200])
-                    continue
-                # Real assistant messages: classify any tool_use blocks for
-                # the post-session reactions. Slack-housekeeping Bash calls
-                # (chat.postMessage etc.) don't count as "tool work".
-                for block in content_blocks:
-                    if not isinstance(block, dict) or block.get("type") != "tool_use":
-                        continue
-                    name = block.get("name")
-                    if name == "Agent":
-                        self.tools_used = True
-                        if (block.get("input") or {}).get("subagent_type") == "opus":
-                            self.opus_used = True
-                    elif name == "Bash":
-                        command = (block.get("input") or {}).get("command") or ""
-                        if "slack.com" not in command:
-                            self.tools_used = True
-                    else:
-                        self.tools_used = True
-
-        async def read_stderr() -> None:
-            assert self.proc and self.proc.stderr
-            async for line in self.proc.stderr:
-                self.last_output_at = time.monotonic()
-                text = line.decode().rstrip()[:500]
-                self.stderr_tail.append(text)
-                log.warning("stderr: %s", text[:200])
-
-        async def watch_stuck() -> None:
-            nonlocal stuck, timed_out
-            while self.proc and self.proc.returncode is None:
-                await asyncio.sleep(30)
-                elapsed = time.monotonic() - started_at
-                idle = time.monotonic() - self.last_output_at
-                if elapsed > MAX_SESSION_SECONDS:
-                    log.warning("session %s exceeded max wall time, killing", self.session_id)
-                    timed_out = True
-                    self._kill()
-                    return
-                if idle > STUCK_TIMEOUT_SECONDS:
-                    log.warning("session %s stuck (no output for %ds), killing", self.session_id, int(idle))
-                    stuck = True
-                    self._kill()
-                    return
-
-        await asyncio.gather(
-            read_stdout(),
-            read_stderr(),
-            watch_stuck(),
-            return_exceptions=True,
-        )
-
-        exit_code = await self.proc.wait()
-        ended_at = time.monotonic()
-
-        log.info("session %s ended (exit=%s stuck=%s timed_out=%s)",
-                 self.session_id, exit_code, stuck, timed_out)
-
-        result = SessionResult(
-            session_id=self.session_id,
-            started_at=started_at,
-            started_at_wall=started_at_wall,
-            ended_at=ended_at,
-            exit_code=exit_code,
-            last_output_at=self.last_output_at,
-            stuck=stuck,
-            timed_out=timed_out,
-            opus_used=self.opus_used,
-            tools_used=self.tools_used,
-            stderr_tail=list(self.stderr_tail),
-            synthetic_errors=list(self.synthetic_errors),
-        )
-
-        # Safety net journal entry — only if the session didn't write one,
-        # which we approximate by checking exit code / stuck / timeout.
-        # Sam writing its own entry is the happy path; this is the fallback.
-        if stuck or timed_out or (exit_code and exit_code != 0):
-            self._safety_net_journal_entry(result)
-
-        return result
-
-    def _kill(self) -> None:
-        if self.proc and self.proc.returncode is None:
-            try:
-                self.proc.kill()
-            except ProcessLookupError:
-                pass
-
-    def _safety_net_journal_entry(self, result: SessionResult) -> None:
-        """Append a minimal journal entry when something went wrong.
-
-        Sam should write its own entries normally. This is for the cases where
-        Sam was killed or crashed and couldn't.
-        """
-        from datetime import datetime
-        status = "stuck" if result.stuck else ("timed_out" if result.timed_out else "errored")
-        entry = f"""---
-date: {datetime.now().astimezone().isoformat()}
-session: {result.session_id}
-trigger: slack mention (channel={self.message.channel})
-status: {status}
----
-
-## What happened
-
-Session ended without writing its own journal entry. Daemon detected: {status}.
-
-The triggering message was from <@{self.message.user}> in channel {self.message.channel}.
-
-## Open threads
-
-The original request may be unaddressed. Future-Sam should check the Slack thread.
-
-"""
-        with journal_path_for_today().open("a") as f:
-            f.write(entry)
 
 # -----------------------------------------------------------------------------
 # Daemon — Slack listener + session queue
 # -----------------------------------------------------------------------------
 
 class Daemon:
-    def __init__(self):
+    def __init__(self) -> None:
         self.app = AsyncApp(token=SLACK_BOT_TOKEN)
         self.handler = AsyncSocketModeHandler(self.app, SLACK_APP_TOKEN)
         self.queue: asyncio.Queue[IncomingMessage] = asyncio.Queue()
@@ -1414,6 +682,8 @@ class Daemon:
         body lives at `src/skills/<name>.md`; the daemon doesn't read it —
         sam reads it when the scheduled message fires.
         """
+        from .config import SAM_SRC
+        from .prompts import _parse_frontmatter
         skills_dir = SAM_SRC / "skills"
         if not skills_dir.exists():
             return []
@@ -1525,8 +795,8 @@ class Daemon:
             log.info("no skills with `cron:` frontmatter; no scheduled tasks running")
 
         log.info(
-            "Sam daemon ready (channel=%s, commit=%s)",
-            SAM_CHANNEL or "all", COMMIT_SHA or "unknown",
+            "Sam daemon ready (channel=%s, commit=%s, model=%s)",
+            SAM_CHANNEL or "all", COMMIT_SHA or "unknown", SAM_MODEL,
         )
 
         await self.shutdown_event.wait()
@@ -1571,11 +841,13 @@ async def amain() -> int:
 
     return 0
 
+
 def main() -> None:
     try:
         sys.exit(asyncio.run(amain()))
     except KeyboardInterrupt:
         sys.exit(130)
+
 
 if __name__ == "__main__":
     main()
