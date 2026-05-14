@@ -9,16 +9,24 @@ cron: 0 22 * * *
 
 The end-of-day maintenance pulse. Four jobs, in this order:
 
-## 1. Share what merged
+## 1. Share what changed about Sam
 
-Check for sam-authored PRs that merged today:
+Check for merges to `dembrane/sam` today — *regardless of author*. A human-merged Tier 3 change still shifts what Sam is; the team needs to know:
 
 ```
-gh pr list --repo Dembrane/sam --author @me --state merged \
+gh pr list --repo Dembrane/sam --state merged \
   --search "merged:>=$(date -u +%Y-%m-%d)"
 ```
 
-If any merged, post ONE message in `#sam`. Use Slack's `<url|title>` link format for each PR.
+If any merged, post ONE message in `#sam` that names the *consequence* for the team, not the list of PRs. Lead with what they should do with the information; the PR links are references, not the headline.
+
+Order by what gates other work:
+
+- **Running-Sam is now stale.** If any merge touched `src/runtime/`, `Dockerfile`, `compose.yml`, or top-level config, the running daemon is older than source until `docker compose up -d --build`. Say so plainly — this is the line that triggers a restart window decision.
+- **Future-Sam learned something / changed how it works.** Tier 1 merges (skills, capabilities) take effect at the next session start with no restart needed. Name the behavior change in one short sentence — what's different about how Sam acts — not "merged PR #14".
+- **Sam's identity or scope shifted.** Tier 2 merges are rare and load-bearing. Name what's now in/out of bounds.
+
+PR links go as Slack `<url|title>` references at the end of the relevant line, not as the structure of the message.
 
 If nothing merged: skip this step. No "nothing to report" post.
 
@@ -49,8 +57,8 @@ First update **Sam's Blockers** canvas via `src/skills/slack-blockers-canvas.md`
 
 Then append a `## Daily synthesis` section to today's journal entry with:
 - one short paragraph naming the day's shape (what got done, what didn't, where Sam stalled).
-- proposed PRs from §3 (if any) — one line each, with the PR number/title.
-- open threads to pick up tomorrow — one line each.
+- proposed PRs from §3 (if any) — one line each. Lead with the behavior change Sam is proposing (e.g. "stop reporting blocker counts when the count didn't change") so future-Sam can grep on intent. The PR number/title is the reference at the end of the line, not the headline.
+- open threads to pick up tomorrow — one line each, named by what future-Sam should do, not what happened.
 - if the active-blocker count changed today, one line: `blockers: <N> active (see canvas)`. Don't re-list blocker details — they're in the canvas.
 
 Merged PRs were already named in §1's Slack post; don't re-list them here.
