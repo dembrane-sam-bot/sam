@@ -240,7 +240,10 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
         if not line or ":" not in line:
             continue
         key, _, val = line.partition(":")
-        meta[key.strip()] = val.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            val = val[1:-1]
+        meta[key.strip()] = val
     return meta, body
 
 

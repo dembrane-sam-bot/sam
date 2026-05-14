@@ -14,6 +14,8 @@ The journal is also how Sam learns over time. Patterns Sam notices, decisions ma
 
 One entry per session. Plain markdown. The structure:
 
+```
+---
 date: 2026-05-12T14:23:00+02:00
 session: <short id, can be random>
 trigger: <what woke Sam up — Slack mention, scheduled check, etc.>
@@ -21,14 +23,23 @@ participants: <who Sam talked to, by Slack handle>
 topics: <2-5 short keywords for grep>
 issues: <issue IDs touched, if any>
 prs: <PR numbers touched, if any>
-What happened
+---
+
+## What happened
 Short prose — what Sam did, what was decided, what was outstanding.
-Open threads
+
+## Open threads
 Anything left unresolved that future-Sam should know about. One line per thread.
-Notes for future-Sam
+
+## Notes for future-Sam
 Anything Sam wants to remember. Patterns noticed. Things that surprised Sam. Things to ask if they come up again.
+```
 
 The front-matter is mandatory. Future-Sam greps it. Without consistent fields, grep doesn't work.
+
+### Session id convention
+
+For human-driven sessions the session id is a short random handle (e.g. `7fa2`, `pr-thread-913`). For cron-fired sessions, prefix with `routine:` followed by the skill name — `session: routine:daily-maintenance`. This lets future-Sam separate scheduled firings from human-driven sessions with a single grep.
 
 ## Writing entries
 

@@ -138,11 +138,12 @@ Style:
 - `when_to_use` is the *condition*, not a tagline. Phrase it so Sam can pattern-match on the inbound task: "Before any Slack reply that…", "When the message contains an attached file and…", etc.
 - Don't repeat the body in the description. The description is the lookup; the body is the content.
 - No emoji in frontmatter values.
-- Single-line values only — no nested structures, no multi-line scalars. The daemon's parser is intentionally simple.
+- Single-line values only — no nested structures, no `|` or `>` block scalars. The daemon's parser is intentionally simple: it splits on the first `:`, strips whitespace, and strips matching outer single or double quotes. That's it. A multi-line block scalar silently mangles into a phantom key for every indented body line that contains a colon.
+- Quote values that contain special characters (`*`, leading zeros, colons, etc.) with single or double quotes. The outer quotes are stripped on read.
 
 Optional fields the daemon will recognize:
 
-- (none yet) — keep the convention small until there's a real need.
+- `cron: <expression>` — a 5-field cron expression (e.g. `cron: 0 22 * * *` or `cron: "*/15 * * * *"`) that schedules the skill. The daemon fires the skill on the cron schedule by injecting a SCHEDULED SKILL block at the top of a fresh Sam session. Use sparingly — most skills should remain reactive.
 
 ## Capabilities vs skills
 
