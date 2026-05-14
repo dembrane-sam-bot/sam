@@ -4,6 +4,19 @@ An engineering coworker.
 
 This repo is Sam — identity, scope, capabilities, skills, and runtime. Read `src/identity.md` to understand who Sam is. Read files in `src/capabilities/` to understand the shape of Sam's work. Skills under `src/skills/` are the specific patterns Sam reaches for when triggered.
 
+## Principles 
+![Sam](https://github.com/user-attachments/assets/755678fd-4a6f-4b2d-be7b-0992ee4421a4)
+
+- multiplayer, self maintaining claude code
+- communication channel
+- project management
+- sandbox as a place of work
+- loop triggered by events
+
+## Open questions
+- use calendar over cron? set reminders, listen to webhooks on cal events? more visibility and also we can log times in the cal when sam works and on what. important events are tracked, sam can kick off a smoke test 1d before, see if all reqs are met.
+- 
+
 ## Layout
 
     src/
@@ -72,3 +85,4 @@ Deploys happen manually:
 
     git pull
     docker compose up -d --build
+
