@@ -559,11 +559,14 @@ class IncomingMessage:
 class SessionResult:
     session_id: str
     started_at: float
+    started_at_wall: float        # time.time() at subprocess launch — for Slack history queries
     ended_at: float
     exit_code: Optional[int]
     last_output_at: float
     stuck: bool
     timed_out: bool
+    opus_used: bool = False       # Agent tool dispatched to opus during the session
+    tools_used: bool = False      # any tool_use that wasn't a Slack housekeeping Bash call
     stderr_tail: list[str] = field(default_factory=list)
     synthetic_errors: list[str] = field(default_factory=list)
 
@@ -588,6 +591,12 @@ class SamSession:
         # Synthetic error messages observed in stdout (claude code surfaces API
         # errors, etc., as assistant messages with model="<synthetic>")
         self.synthetic_errors: deque[str] = deque(maxlen=SYNTHETIC_ERRORS_MAX)
+        # Lifecycle flags surfaced as Slack reactions after the session ends.
+        # opus_used = the Agent tool dispatched to opus.
+        # tools_used = any tool_use happened that wasn't just Slack housekeeping
+        # (Bash with "slack.com" in the command — posts, reactions, replies).
+        self.opus_used: bool = False
+        self.tools_used: bool = False
 
     async def run(self) -> SessionResult:
         system_prompt = assemble_system_prompt()
@@ -599,6 +608,9 @@ class SamSession:
         )
 
         started_at = time.monotonic()
+        # Wall-clock start, so the daemon can query Slack history for messages
+        # Sam posts during this session.
+        started_at_wall = time.time()
 
         # Build the input the Claude CLI expects on stdin (stream-json input)
         # Format: one JSON object per line, each being {type: "user", message: {role: "user", content: "..."}}
@@ -656,14 +668,32 @@ class SamSession:
                 if event.get("type") != "assistant":
                     continue
                 msg = event.get("message") or {}
-                if msg.get("model") != "<synthetic>":
+                content_blocks = msg.get("content") or []
+                if msg.get("model") == "<synthetic>":
+                    for block in content_blocks:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = (block.get("text") or "").strip()
+                            if text:
+                                self.synthetic_errors.append(text[:1000])
+                                log.warning("synthetic error: %s", text[:200])
                     continue
-                for block in msg.get("content") or []:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = (block.get("text") or "").strip()
-                        if text:
-                            self.synthetic_errors.append(text[:1000])
-                            log.warning("synthetic error: %s", text[:200])
+                # Real assistant messages: classify any tool_use blocks for
+                # the post-session reactions. Slack-housekeeping Bash calls
+                # (chat.postMessage etc.) don't count as "tool work".
+                for block in content_blocks:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    name = block.get("name")
+                    if name == "Agent":
+                        self.tools_used = True
+                        if (block.get("input") or {}).get("subagent_type") == "opus":
+                            self.opus_used = True
+                    elif name == "Bash":
+                        command = (block.get("input") or {}).get("command") or ""
+                        if "slack.com" not in command:
+                            self.tools_used = True
+                    else:
+                        self.tools_used = True
 
         async def read_stderr() -> None:
             assert self.proc and self.proc.stderr
@@ -706,11 +736,14 @@ class SamSession:
         result = SessionResult(
             session_id=self.session_id,
             started_at=started_at,
+            started_at_wall=started_at_wall,
             ended_at=ended_at,
             exit_code=exit_code,
             last_output_at=self.last_output_at,
             stuck=stuck,
             timed_out=timed_out,
+            opus_used=self.opus_used,
+            tools_used=self.tools_used,
             stderr_tail=list(self.stderr_tail),
             synthetic_errors=list(self.synthetic_errors),
         )
@@ -956,6 +989,68 @@ class Daemon:
                 break
         self._thread_cache[key] = (participates, time.monotonic())
         return participates
+
+    async def _add_session_reactions(
+        self, message: IncomingMessage, result: SessionResult,
+    ) -> None:
+        """Add :brain: / :gear: reactions to Sam's most recent post.
+
+        Lifecycle complement to :eyes: (added on inbound messages at queue time):
+        - :brain: when the session dispatched the opus subagent.
+        - :gear: when the session did any non-Slack-housekeeping tool work.
+
+        Skip on failed sessions — the post (if any) might be partial garbage.
+        Skip if neither flag is set — nothing to mark.
+        """
+        if result.failed or not (result.opus_used or result.tools_used):
+            return
+        if not self.bot_user_id:
+            return
+        oldest = f"{result.started_at_wall:.6f}"
+        target_ts: Optional[str] = None
+        try:
+            if message.scheduled or not (message.thread_ts or message.event_ts):
+                resp = await self.app.client.conversations_history(
+                    channel=message.channel, oldest=oldest, inclusive=False, limit=20,
+                )
+            else:
+                resp = await self.app.client.conversations_replies(
+                    channel=message.channel,
+                    ts=message.thread_ts or message.event_ts,
+                    oldest=oldest, inclusive=False, limit=100,
+                )
+        except Exception:
+            log.exception("could not fetch messages for reaction-adding")
+            return
+        # Walk newest-first to find Sam's latest post. conversations_history
+        # returns newest-first; conversations_replies returns oldest-first.
+        # Try both directions to be safe.
+        msgs = resp.get("messages", []) or []
+        for m in reversed(msgs):
+            if m.get("user") == self.bot_user_id or m.get("bot_id"):
+                target_ts = m.get("ts")
+                if target_ts:
+                    break
+        if not target_ts:
+            for m in msgs:
+                if m.get("user") == self.bot_user_id or m.get("bot_id"):
+                    target_ts = m.get("ts")
+                    if target_ts:
+                        break
+        if not target_ts:
+            return
+        reactions: list[str] = []
+        if result.opus_used:
+            reactions.append("brain")
+        if result.tools_used:
+            reactions.append("gear")
+        for name in reactions:
+            try:
+                await self.app.client.reactions_add(
+                    channel=message.channel, timestamp=target_ts, name=name,
+                )
+            except Exception as e:
+                log.debug("reactions.add %s failed on %s: %s", name, target_ts, e)
 
     async def _post_eyes_reaction(self, channel: str, ts: str) -> None:
         """Add :eyes: to the inbound message so the user knows it landed.
@@ -1232,6 +1327,8 @@ class Daemon:
                     first_result = None
 
                 if first_result is None or not first_result.failed:
+                    if first_result is not None:
+                        await self._add_session_reactions(message, first_result)
                     continue
 
                 log.info(
@@ -1269,6 +1366,8 @@ class Daemon:
                         retry_result.exit_code if retry_result else "n/a",
                     )
                     await self._post_operator_alert(message, first_result, retry_result)
+                else:
+                    await self._add_session_reactions(retry_message, retry_result)
 
     async def _post_operator_alert(
         self,
