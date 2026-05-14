@@ -246,6 +246,55 @@ def save_cursor(ts: str) -> None:
     CURSOR_PATH.write_text(json.dumps({"last_seen_ts": ts}))
 
 # -----------------------------------------------------------------------------
+# Prompt templates — content the daemon synthesises and hands to Sam sessions
+#
+# Kept at module top so daemon-authored prompt content is visibly grouped and
+# named, separate from the control flow that decides when each fires. The
+# system-prompt orchestration block lives separately at
+# `src/runtime/orchestration.md` because every session reads it; the templates
+# below are situational user-message content for specific wake-up types.
+# -----------------------------------------------------------------------------
+
+RETRY_SESSION_INTRO = (
+    "A previous Sam session attempting to respond to a Slack message FAILED.\n"
+    "Do not retry the original task. Your one job in this session is:\n"
+    "\n"
+    "1. Read the failure context below.\n"
+    "2. Post ONE reply in the original Slack thread (channel={channel}, "
+    "thread_ts={thread_target}) in your normal Slack voice. Name what failed "
+    "in human terms, name the likely cause, and suggest a concrete fix. "
+    "Don't dump stderr verbatim — read it, summarise it.\n"
+    "3. Then stop. This is a one-shot. The daemon will not retry again."
+)
+
+RETRY_SESSION_OUTRO = (
+    "Remember: post ONCE, in the original thread, in your Slack voice. "
+    "Be honest about the failure. Suggest a fix if you can see one. "
+    "Prefer the synthetic errors above over stderr when identifying the cause. "
+    "Then exit."
+)
+
+SCHEDULED_SKILL_TEMPLATE = (
+    "This is a SCHEDULED SKILL invocation — not a Slack message. "
+    "The daemon's scheduler triggered `{skill_name}`. "
+    "Read `src/skills/{skill_name}.md` for the full directive, then follow it.\n\n"
+    "BEFORE running the full directive: grep today's journal file "
+    "({today_journal}) for past fires of `{skill_name}`. If past-you "
+    "already ran it today, your job here is a delta check — what changed "
+    "since the previous fire? — not a full re-run. If past-you only got "
+    "partway, pick up where it stopped. If today's file has no prior fire, "
+    "this is the first run and you do the whole directive.\n\n"
+    "Target channel for any Slack post: {channel}. "
+    "Silence is acceptable — only post when there's substance."
+)
+
+OPERATOR_ALERT_TEMPLATE = (
+    "{mention}something's wrong with me — i tried to respond and {first_status}, "
+    "then tried to explain what failed and that also {retry_status}. "
+    "need your eyes."
+)
+
+# -----------------------------------------------------------------------------
 # System prompt assembly
 # -----------------------------------------------------------------------------
 
@@ -340,50 +389,11 @@ def assemble_system_prompt() -> str:
         if catalog:
             sections.append(catalog)
 
-    orchestration = """
-# ORCHESTRATION
-
-You are Sam, running as a Claude Code session. Each time you wake up, you
-are responding to a Slack message that came in via the daemon.
-
-You are running source at commit `{commit_sha}`. When you propose a Tier 3
-(runtime) PR or talk publicly about behaviour changes, quote this commit so
-observers can tell whether what they're seeing is "live" or "pending the
-next container restart."
-
-Before responding, decide what context you need and go get it. Use:
-- The journal: one file per day at `/data/journal/<YYYY-MM-DD>.md`. Today's
-  file is where you'll write this session's entry. The pre-directory combined
-  journal is still at `/data/journal.md` (kept in place for grep continuity).
-  When looking back, grep across BOTH `/data/journal/` AND `/data/journal.md`.
-- The Linear API for issues and comments (`LINEAR_API_KEY` is in env)
-- The GitHub API and `gh` CLI for PRs, issues, code (`GITHUB_TOKEN` is in env)
-- The Slack Web API for posting back (`SLACK_BOT_TOKEN` is in env)
-- Repos cloned under `/data/repos/` (clone what you need, fetch what's stale)
-- Sam's own source under `src/` — identity, scope, capabilities, skills
-
-The Slack message that triggered this session is at the start of your
-conversation. The channel ID and thread timestamp are included so you can
-post back in the right place. The sender's display name and principal-
-operator status are also included — use them verbatim in journal entries.
-Do NOT infer a sender's identity from the `<@U…>` mention alone; the
-daemon already resolved the name for you.
-
-If the start of your conversation is a "SCHEDULED SKILL invocation" block
-instead of a Slack message, the daemon's scheduler triggered a skill that
-has a `cron:` field in its frontmatter. Read the named skill file and
-follow it. Silence (post nothing) is an acceptable answer for scheduled
-wake-ups; only post when there's substance.
-
-Before you finish, append a journal entry to today's file at
-`/data/journal/<YYYY-MM-DD>.md`. Follow the format in
-`src/capabilities/journal.md`. This is how future-you remembers.
-
-Be honest, terse, and useful. Don't perform engagement. Don't explain what
-you're about to do unless someone is going to be watching the status
-indicator. Just do it, then say the result.
-"""
-    sections.append(orchestration.format(commit_sha=COMMIT_SHA or "unknown"))
+    orchestration_path = SAM_SRC / "runtime" / "orchestration.md"
+    if orchestration_path.exists():
+        sections.append(
+            orchestration_path.read_text().format(commit_sha=COMMIT_SHA or "unknown")
+        )
 
     return "\n\n---\n\n".join(sections)
 
@@ -489,12 +499,7 @@ class IncomingMessage:
             failure_summary = f"Exited with non-zero code: {ctx.get('exit_code')}."
 
         lines = [
-            "A previous Sam session attempting to respond to a Slack message FAILED.",
-            "Do not retry the original task. Your one job in this session is:",
-            "",
-            f"1. Read the failure context below.",
-            f"2. Post ONE reply in the original Slack thread (channel={self.channel}, thread_ts={thread_target}) in your normal Slack voice. Name what failed in human terms, name the likely cause, and suggest a concrete fix. Don't dump stderr verbatim — read it, summarise it.",
-            "3. Then stop. This is a one-shot. The daemon will not retry again.",
+            RETRY_SESSION_INTRO.format(channel=self.channel, thread_target=thread_target),
             "",
             "## What the previous session was trying to handle",
             f"From {self._sender_label()} in channel {self.channel} ({thread_part}):",
@@ -543,12 +548,7 @@ class IncomingMessage:
             lines.append("```")
 
         lines.append("")
-        lines.append(
-            "Remember: post ONCE, in the original thread, in your Slack voice. "
-            "Be honest about the failure. Suggest a fix if you can see one. "
-            "Prefer the synthetic errors above over stderr when identifying the cause. "
-            "Then exit."
-        )
+        lines.append(RETRY_SESSION_OUTRO)
         return "\n".join(lines)
 
 # -----------------------------------------------------------------------------
@@ -1395,10 +1395,8 @@ class Daemon:
         else:
             retry_status = f"exit {retry.exit_code}"
 
-        text = (
-            f"{mention}something's wrong with me — i tried to respond and {first_status}, "
-            f"then tried to explain what failed and that also {retry_status}. "
-            f"need your eyes."
+        text = OPERATOR_ALERT_TEMPLATE.format(
+            mention=mention, first_status=first_status, retry_status=retry_status,
         )
         try:
             await self.app.client.chat_postMessage(
@@ -1471,18 +1469,10 @@ class Daemon:
     async def _enqueue_scheduled_skill(self, skill_name: str) -> None:
         ts = f"{time.time():.6f}"
         today_journal = f"/data/journal/{datetime.now().date().isoformat()}.md"
-        text = (
-            f"This is a SCHEDULED SKILL invocation — not a Slack message. "
-            f"The daemon's scheduler triggered `{skill_name}`. "
-            f"Read `src/skills/{skill_name}.md` for the full directive, then follow it.\n\n"
-            f"BEFORE running the full directive: grep today's journal file "
-            f"({today_journal}) for past fires of `{skill_name}`. If past-you "
-            f"already ran it today, your job here is a delta check — what changed "
-            f"since the previous fire? — not a full re-run. If past-you only got "
-            f"partway, pick up where it stopped. If today's file has no prior fire, "
-            f"this is the first run and you do the whole directive.\n\n"
-            f"Target channel for any Slack post: {SAM_CHANNEL}. "
-            f"Silence is acceptable — only post when there's substance."
+        text = SCHEDULED_SKILL_TEMPLATE.format(
+            skill_name=skill_name,
+            today_journal=today_journal,
+            channel=SAM_CHANNEL,
         )
         message = IncomingMessage(
             channel=SAM_CHANNEL,
