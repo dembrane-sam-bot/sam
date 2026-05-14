@@ -36,8 +36,8 @@ Each blocker is one bullet with nested metadata:
 
 ## Content rules
 
-- Keep entries actionable and short; no narratives.
-- Prefer explicit asks ("need X approved", "need Y secret added") over vague status.
+- Each field is one line — `needs:` and `impact:` already carry the consequence framing (per `src/identity.md` "Lead with the consequence"). Don't pile a third narrative line below them; if a blocker needs more context, link a thread under `links:`.
+- Prefer forward-looking asks ("need X approved before search v2 ships", "need Y secret added before the cron skill can run") over status that only names the event ("X is pending", "Y is in progress"). The next reader should know what to *do* with this entry without opening links.
 - If an item no longer blocks work, move it to "Recently unblocked" or remove it.
 - If priority changes, move the item between sections and update `last_seen_ts`.
 

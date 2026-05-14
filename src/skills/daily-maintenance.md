@@ -1,29 +1,32 @@
 ---
 name: daily-maintenance
 description: End-of-day maintenance pass. Reviews today's journal and any sam-authored PRs that merged today, posts a short "merged today" update in #sam if there's substance, keeps the blockers canvas current, identifies patterns worth codifying, and opens self-PRs for concrete improvements.
-when_to_use: |
-  Fired by the daemon at 22:00 local. Also reachable manually when someone in
-  slack asks "what did you learn today", "anything to change about how you
-  work?", or "what is currently blocked?".
-cron: "0 22 * * *"
+when_to_use: Fired by the daemon at 22:00 local. Also reachable manually when a teammate asks "what did you learn today", "anything to change about how you work?", or "what is currently blocked?".
+cron: 0 22 * * *
 ---
 
 # Skill: daily-maintenance
 
 The end-of-day maintenance pulse. Four jobs, in this order:
 
-## 1. Share what merged
+## 1. Share what changed about Sam
 
-Check for sam-authored PRs that merged today:
+Check for merges to `dembrane/sam` today — *regardless of author*. A human-merged Tier 3 change still shifts what Sam is; the team needs to know:
 
 ```
-gh pr list --repo Dembrane/sam --author @me --state merged \
+gh pr list --repo Dembrane/sam --state merged \
   --search "merged:>=$(date -u +%Y-%m-%d)"
 ```
 
-If any merged, post ONE message in `#sam` (top-level, not a thread reply). Use Slack's `<url|title>` link format for each PR.
+If any merged, post ONE message in `#sam` that names the *consequence* for the team, not the list of PRs. Lead with what they should do with the information; the PR links are references, not the headline.
 
-Flag any Tier 3 (`src/runtime/`) merges with *"needs daemon restart"* so sameer knows the running sam is still the old sam until the next rebuild.
+Order by what gates other work:
+
+- **Running-Sam is now stale.** If any merge touched `src/runtime/`, `Dockerfile`, `compose.yml`, or top-level config, the running daemon is older than source until `docker compose up -d --build`. Say so plainly — this is the line that triggers a restart window decision.
+- **Future-Sam learned something / changed how it works.** Tier 1 merges (skills, capabilities) take effect at the next session start with no restart needed. Name the behavior change in one short sentence — what's different about how Sam acts — not "merged PR #14".
+- **Sam's identity or scope shifted.** Tier 2 merges are rare and load-bearing. Name what's now in/out of bounds.
+
+PR links go as Slack `<url|title>` references at the end of the relevant line, not as the structure of the message.
 
 If nothing merged: skip this step. No "nothing to report" post.
 
@@ -44,22 +47,23 @@ Walk each entry and ask:
 
 If reflection surfaces something concrete to codify, first decide where it belongs using `src/capabilities/self-maintenance.md` ("Where does a change belong?"), then open self-PRs via the same file's flow. **No artificial cap on how many** — open one per distinct concept.
 
-Each PR description names the specific behavior that triggered it (cite session ID), the file + line being changed, and the tier. Tier 2 changes only with explicit sign-off from the principal operator in the thread.
+Each PR description names the specific behavior that triggered it (cite session ID), the file + line being changed, and the tier. Tier 2 changes only with explicit sign-off from the principal operator in the thread — so on cron-fired runs (no live thread) Sam opens Tier 1 PRs only and surfaces any Tier 2 idea as an open thread in the synthesis instead.
 
 If nothing is worth a code change today, open no self-maintenance PRs.
 
 ## 4. Sync blockers and write synthesis
 
-Use `src/skills/slack-blockers-canvas.md` to update **Sam's Blockers** canvas as part of this run.
+First update **Sam's Blockers** canvas via `src/skills/slack-blockers-canvas.md`. The canvas is the source of truth for blockers; the journal references it, never duplicates it.
 
-Append a `## Daily synthesis` section to today's journal entry with:
-- merged PRs (if any) — one line each.
-- one short paragraph naming the day's shape (what got done, what didn't).
-- proposed PRs (if any) — one line each, with the PR number/title.
-- blockers waiting on external input — one line each, grouped by priority, with `last_seen_ts` (ISO8601 local timezone).
-- open threads to pick up tomorrow — one line each.
+Then append a `## Daily synthesis` section to today's journal entry with:
+- one short paragraph naming the day's shape (what got done, what didn't, where Sam stalled).
+- proposed PRs from §3 (if any) — one line each. Lead with the behavior change Sam is proposing (e.g. "stop reporting blocker counts when the count didn't change") so future-Sam can grep on intent. The PR number/title is the reference at the end of the line, not the headline.
+- open threads to pick up tomorrow — one line each, named by what future-Sam should do, not what happened.
+- if the active-blocker count changed today, one line: `blockers: <N> active (see canvas)`. Don't re-list blocker details — they're in the canvas.
 
-Skip the synthesis section entirely on a day with nothing to say.
+Merged PRs were already named in §1's Slack post; don't re-list them here.
+
+If none of the four items above has content, skip the section entirely. Don't write a "nothing to say" placeholder.
 
 ## What this skill does NOT do
 
