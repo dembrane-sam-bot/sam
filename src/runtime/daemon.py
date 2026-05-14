@@ -53,6 +53,11 @@ SAM_OPERATOR_USER_ID = os.environ.get("SAM_OPERATOR_USER_ID")  # @-mentioned whe
 SAM_HOME = Path(os.environ.get("SAM_HOME", "/data"))
 SAM_REPO = Path("/home/sam")          # where Sam's checkout lives in the container
 SAM_SRC = SAM_REPO / "src"            # identity, scope, capabilities, skills, runtime
+SAM_CLAUDE_DIR = SAM_REPO / ".claude" # where Claude Code looks for project-level config
+
+# Default model for Sam's main session. Sam dispatches to the opus subagent
+# (see src/runtime/agents/opus.md) when it wants deeper reasoning.
+SAM_MODEL = "sonnet"
 
 JOURNAL_DIR = SAM_HOME / "journal"
 # Pre-directory combined journal lives alongside the new directory and stays
@@ -90,6 +95,30 @@ def _read_commit_sha() -> Optional[str]:
 
 
 COMMIT_SHA: Optional[str] = _read_commit_sha()
+
+
+def provision_subagents() -> None:
+    """Copy Tier 3 subagent definitions into the place Claude Code looks for them.
+
+    Subagent definitions live under `src/runtime/agents/` (Tier 3 — substrate,
+    not Sam-editable). Claude Code only auto-discovers agents under
+    `.claude/agents/`, so on each daemon start we mirror the substrate copies
+    into that runtime path. If a teammate (or Sam itself, accidentally)
+    overwrote one of those files between restarts, this restores it.
+    """
+    source_dir = SAM_SRC / "runtime" / "agents"
+    if not source_dir.exists():
+        return
+    target_dir = SAM_CLAUDE_DIR / "agents"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for src in sorted(source_dir.glob("*.md")):
+        dst = target_dir / src.name
+        try:
+            dst.write_text(src.read_text())
+            log.info("provisioned subagent: %s", dst)
+        except OSError:
+            log.exception("could not provision subagent %s", src)
+
 
 # How long without any stdout/stderr output before we consider Sam stuck
 STUCK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes
@@ -589,8 +618,9 @@ class SamSession:
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--include-partial-messages",
+            "--model", SAM_MODEL,
             "--system-prompt", system_prompt,
-            "--allowed-tools", "Bash,Read,Write,Edit,Grep,Glob,WebFetch,WebSearch",
+            "--allowed-tools", "Bash,Read,Write,Edit,Grep,Glob,WebFetch,WebSearch,Agent",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1368,6 +1398,10 @@ class Daemon:
         await self.queue.put(message)
 
     async def run(self) -> None:
+        # Provision Tier 3 subagent definitions into the path Claude Code reads.
+        # Done before any session can run so the very first wake-up sees them.
+        provision_subagents()
+
         # Identify ourselves so we can recognize and skip our own messages.
         try:
             auth = await self.app.client.auth_test()
