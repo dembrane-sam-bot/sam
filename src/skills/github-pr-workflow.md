@@ -99,7 +99,7 @@ This section earns trust over time. Hide problems in it once and it becomes usel
 
 ## After opening a PR
 
-Post in Slack with the PR link and a brief summary.
+Post in Slack with the PR link and a one-line *consequence* summary — what the merge will change for the team, and what (if anything) is shaky enough to watch after it lands. Not "opened a PR titled X"; rather "PR up to fix the export timezone bug — safe for the next migration window, flagging the rollback path as untested." See `src/identity.md` "Lead with the consequence" for the framing.
 
 Watch CI. When CI completes:
 
