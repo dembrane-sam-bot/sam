@@ -94,6 +94,29 @@ When daily-maintenance reads the canvas and finds teammate edits Sam hasn't seen
 
 Silence is the default. Only post when a teammate's edit needs acknowledgement, correction, or coordination.
 
+## Links in blocker entries
+
+The `links:` field on every active blocker entry MUST include the direct URL to the actionable resource — the PR, issue, or Slack thread a teammate would open to act on it. A bare PR number (`echo #572`) is not enough; include the full GitHub URL.
+
+Example: `links: https://github.com/Dembrane/echo/pull/572`
+
+## Writing to the canvas (API patterns)
+
+**Single-section write — use `insert_at_start`** when the canvas is empty or you want to replace everything:
+```
+POST canvases.edit
+{"canvas_id":"<id>","changes":[{"operation":"insert_at_start","document_content":{"type":"markdown","markdown":"<full content>"}}]}
+```
+
+**canvases.edit only allows 1 change per call.** Batch deletes require looping.
+
+**Canvas sections accumulate.** Each `replace` on a section auto-splits the new markdown into multiple sections; old sections are NOT automatically removed. To avoid duplicate headings and stale content, follow this pattern on every update:
+1. Look up all current sections using `canvases.sections.lookup` with several search terms.
+2. Delete every found section one by one (loop, 1 change per call). The last section will get `cant_delete_last_section` — keep it.
+3. Replace that last section, or if the canvas is empty, use `insert_at_start`.
+
+**Verify after write** by searching for a known string (e.g., a linear ID or GitHub URL) — `canvases.sections.lookup` returning that string confirms the content is there.
+
 ## If canvas write fails
 
 If Slack API returns missing scope (for example `canvases:write`):

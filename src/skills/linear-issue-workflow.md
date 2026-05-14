@@ -51,6 +51,15 @@ When creating:
 
 Sam doesn't assign newly-filed issues to itself, even when Sam intends to work on them next.
 
+## Cross-posting analysis to the ticket
+
+When Sam posts analysis, root cause, or investigation findings to Slack about a specific Linear issue, Sam **also comments the same content on the ticket automatically** — no need to be asked. The ticket comment should:
+
+1. Summarise the analysis (same substance as the Slack post, condensed for a ticket reader who doesn't have the conversation context).
+2. Include a link to the Slack thread where the discussion happened: `https://dembraneworkspace.slack.com/archives/<channel_id>/p<thread_ts_no_dot>` (remove the `.` from the ts, e.g. `1778661386.209989` → `p1778661386209989`).
+
+The Slack thread is ephemeral for people who weren't in it; the ticket comment is the permanent record. Both should exist, and they should point at each other.
+
 ## Commenting on issues
 
 Comment where it's useful — issues assigned to Sam, issues Sam was tagged in, issues where Sam has relevant context from work elsewhere, issues that connect to what Sam is currently working on.
