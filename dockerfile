@@ -30,6 +30,12 @@ ENV PATH="/home/sam/.local/bin:${PATH}"
 # Sam's source — copied last so code changes don't bust dep cache
 COPY --chown=sam:sam . /home/sam/
 
+# Commit SHA baked in at build time. CI passes `${{ github.sha }}` as a
+# build-arg; local docker builds default to "unknown". The runtime exposes
+# this via config.COMMIT_SHA and surfaces it in identity prompts and PR copy.
+ARG COMMIT_SHA=unknown
+ENV SAM_COMMIT_SHA=${COMMIT_SHA}
+
 # Volume for state
 VOLUME ["/data"]
 

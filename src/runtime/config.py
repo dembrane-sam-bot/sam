@@ -223,9 +223,24 @@ def _read_commit_sha() -> Optional[str]:
 
     Read once at module import. Stable for the process lifetime — the
     container is rebuilt to pick up new code, so the SHA doesn't shift
-    mid-run. Returns None if `git` isn't available or the working tree
-    isn't a git checkout (e.g. running outside docker for tests).
+    mid-run.
+
+    Resolution order:
+    1. `SAM_COMMIT_SHA` env var — set by the Dockerfile from the
+       `COMMIT_SHA` build-arg the CI workflow passes (`${{ github.sha }}`).
+       This is the path that actually fires on Cloud Run, because the
+       deployed image doesn't ship `.git/`.
+    2. `git rev-parse --short HEAD` against `SAM_REPO` — only works in
+       dev/test scenarios where someone is running the daemon out of a
+       live checkout. Returns None on Cloud Run.
+
+    Returns None only when neither source is available — surfaced to the
+    LLM as "running source at commit `unknown`".
     """
+    env_sha = os.environ.get("SAM_COMMIT_SHA")
+    if env_sha:
+        # Normalize to short form (7) for consistency with `git rev-parse --short`.
+        return env_sha[:7]
     try:
         # noqa rationale: static args, `git` is on PATH inside the container image.
         result = subprocess.run(  # noqa: S603
