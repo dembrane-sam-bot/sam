@@ -399,7 +399,8 @@ class SamSession:
         post-session badges.
 
         ADK tool names (function names from adk_runner.py):
-        - arc_used     = AgentTool "arc" was dispatched (big model).
+        - arc_used     = "arc" (single dispatch) or "parallel_arc_research"
+                         (fan-out) was called — either counts as big-model use.
         - web_used     = fetch_url was called.
         - bash_used    = bash was called for non-Slack-housekeeping work (bash
           calls whose command contains "slack.com" are post/react/reply
@@ -419,7 +420,7 @@ class SamSession:
         for record in records:
             name = record.name
             input_dict = record.input or {}
-            if name == "arc":
+            if name in ("arc", "parallel_arc_research"):
                 arc_used = True
             elif name == "fetch_url":
                 web_used = True

@@ -5,18 +5,21 @@ with Vertex AI Gemini models.
 
 Architecture:
   main agent — SAM_SMALL_MODEL (gemini flash)
-    ├── bash           run shell commands
-    ├── read_file      read files from disk
-    ├── write_file     write files to disk
-    ├── edit_file      exact-string replacement in files
-    ├── grep           search file contents
-    ├── glob_files     find files by pattern
-    ├── fetch_url      fetch a URL and return content
-    └── arc            AgentTool → arc agent (SAM_BIG_MODEL, gemini pro, read-only)
-                           ├── read_file
-                           ├── grep
-                           ├── glob_files
-                           └── fetch_url
+    ├── bash                    run shell commands
+    ├── read_file               read files from disk
+    ├── write_file              write files to disk
+    ├── edit_file               exact-string replacement in files
+    ├── grep                    search file contents
+    ├── glob_files              find files by pattern
+    ├── fetch_url               fetch a URL and return content
+    ├── arc                     AgentTool → arc agent (SAM_BIG_MODEL, single task)
+    │                               ├── read_file
+    │                               ├── grep
+    │                               ├── glob_files
+    │                               └── fetch_url
+    └── parallel_arc_research   fan-out: N arc agents run via asyncio.gather
+                                    each branch gets its own LlmAgent + InMemorySession
+                                    results returned labeled and concatenated
 
 Vertex AI auth: set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, and
 GOOGLE_APPLICATION_CREDENTIALS (or use workload identity) in the environment.
@@ -245,6 +248,90 @@ def _load_arc_instruction() -> str:
     return text.strip()
 
 
+# ─── Parallel arc fan-out ─────────────────────────────────────────────────────
+
+
+def _make_parallel_arc_tool(arc_instruction: str):
+    """Return a coroutine that fans out N arc tasks in parallel via asyncio.gather.
+
+    Each task gets a fresh LlmAgent(arc) + InMemorySessionService so there is
+    no shared state between branches. Results are returned in order, labeled by
+    task number, and concatenated with a separator.
+
+    Use this when you have 2+ independent research or analysis questions —
+    e.g. "read file A" and "search for pattern B simultaneously". Do not use for
+    sequential tasks where one result feeds the next (call arc twice instead).
+    """
+
+    async def parallel_arc_research(tasks: list[str]) -> str:
+        """Run each task in parallel against a fresh arc (big model) agent.
+
+        tasks: list of self-contained task descriptions. Each is dispatched to
+        its own arc instance simultaneously. Returns all results labeled and
+        concatenated.
+        """
+        try:
+            from google.adk.agents import LlmAgent
+            from google.adk.runners import Runner
+            from google.adk.sessions import InMemorySessionService
+            from google.adk.tools import FunctionTool
+            from google.genai import types as genai_types
+        except ImportError as exc:
+            return f"error: google-adk not installed — {exc}"
+
+        if not tasks:
+            return "error: no tasks provided"
+
+        async def run_one(task: str, idx: int) -> str:
+            arc = LlmAgent(
+                name=f"arc_{idx}",
+                model=SAM_BIG_MODEL,
+                instruction=arc_instruction,
+                tools=[
+                    FunctionTool(func=read_file),
+                    FunctionTool(func=grep),
+                    FunctionTool(func=glob_files),
+                    FunctionTool(func=fetch_url),
+                ],
+            )
+            svc = InMemorySessionService()
+            arc_runner = Runner(
+                agent=arc, app_name="sam_fanout", session_service=svc
+            )
+            session = await svc.create_session(
+                app_name="sam_fanout", user_id="sam"
+            )
+            user_content = genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(text=task)],
+            )
+            result_parts: list[str] = []
+            try:
+                async for event in arc_runner.run_async(
+                    user_id="sam",
+                    session_id=session.id,
+                    new_message=user_content,
+                ):
+                    content = getattr(event, "content", None)
+                    if content:
+                        for part in (getattr(content, "parts", None) or []):
+                            text = getattr(part, "text", None)
+                            if text:
+                                result_parts.append(text)
+            except Exception as exc:
+                return f"(arc_{idx} error: {exc})"
+            return "".join(result_parts) or "(no output)"
+
+        results = await asyncio.gather(*[run_one(t, i + 1) for i, t in enumerate(tasks)])
+        sections = [
+            f"**arc task {i + 1}:** {task}\n\n{result}"
+            for i, (task, result) in enumerate(zip(tasks, results))
+        ]
+        return "\n\n---\n\n".join(sections)
+
+    return parallel_arc_research
+
+
 # ─── ADK runner ───────────────────────────────────────────────────────────────
 
 
@@ -293,15 +380,20 @@ class ADKAgentRunner:
             FunctionTool(func=fetch_url),
         ]
 
+        arc_instruction = _load_arc_instruction()
+
         # Arc — the big model, read-only.
         arc_agent = LlmAgent(
             name="arc",
             model=SAM_BIG_MODEL,
-            instruction=_load_arc_instruction(),
+            instruction=arc_instruction,
             tools=ro_tools,
         )
 
-        # Main — small model, full tools including arc.
+        # parallel_arc_research — fan-out to N fresh arc agents concurrently.
+        parallel_arc = _make_parallel_arc_tool(arc_instruction)
+
+        # Main — small model, full tools including single-arc and fan-out.
         main_agent = LlmAgent(
             name="sam",
             model=SAM_SMALL_MODEL,
@@ -312,6 +404,7 @@ class ADKAgentRunner:
                 FunctionTool(func=write_file),
                 FunctionTool(func=edit_file),
                 AgentTool(agent=arc_agent),
+                FunctionTool(func=parallel_arc),
             ],
         )
 
