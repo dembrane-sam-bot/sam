@@ -1,14 +1,13 @@
-FROM node:22-slim
+FROM python:3.12-slim
 
-# System packages: git for repo work, python for daemon, gh for GitHub API, build tools
+# System packages: git for repo work, gh for GitHub API, ripgrep for grep tool,
+# curl/gnupg for the gh apt repo setup
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    python3 \
-    python3-pip \
-    python3-venv \
     ca-certificates \
     curl \
     gnupg \
+    ripgrep \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -16,9 +15,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
  && apt-get update && apt-get install -y gh \
  && rm -rf /var/lib/apt/lists/*
-
-# Claude Code CLI, pinned
-RUN npm install -g @anthropic-ai/claude-code@2.1.139
 
 # Non-root user
 RUN useradd --create-home --shell /bin/bash sam

@@ -35,9 +35,11 @@ SAM_REPO = Path("/home/sam")          # where Sam's checkout lives in the contai
 SAM_SRC = SAM_REPO / "src"            # identity, scope, capabilities, skills, runtime
 SAM_CLAUDE_DIR = SAM_REPO / ".claude" # where Claude Code looks for project-level config
 
-# Default model for Sam's main session. Sam dispatches to the opus subagent
-# (see src/runtime/agents/opus.md) when it wants deeper reasoning.
-SAM_MODEL = "sonnet"
+# Model selection — version-controlled config, not .env.
+# Small model: main session. Big model: arc subagent for deep reasoning.
+# Change these by opening a PR to src/runtime/config.py, not via env vars.
+SAM_SMALL_MODEL = "gemini-2.5-flash"
+SAM_BIG_MODEL = "gemini-2.5-pro"
 
 JOURNAL_DIR = SAM_HOME / "journal"
 # Pre-directory combined journal lives alongside the new directory and stays
@@ -219,23 +221,11 @@ COMMIT_SHA: Optional[str] = _read_commit_sha()
 # -----------------------------------------------------------------------------
 
 def provision_subagents() -> None:
-    """Copy Tier 3 subagent definitions into the place Claude Code looks for them.
+    """No-op with ADK runner.
 
-    Subagent definitions live under `src/runtime/agents/` (Tier 3 — substrate,
-    not Sam-editable). Claude Code only auto-discovers agents under
-    `.claude/agents/`, so on each daemon start we mirror the substrate copies
-    into that runtime path. If a teammate (or Sam itself, accidentally)
-    overwrote one of those files between restarts, this restores it.
+    Previously copied agent .md files into .claude/agents/ for Claude Code
+    auto-discovery. ADK loads the arc agent directly from
+    src/runtime/agents/arc.md at runner startup — no filesystem mirroring
+    needed. The function is kept so daemon.py call-sites don't need to change.
     """
-    source_dir = SAM_SRC / "runtime" / "agents"
-    if not source_dir.exists():
-        return
-    target_dir = SAM_CLAUDE_DIR / "agents"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for src in sorted(source_dir.glob("*.md")):
-        dst = target_dir / src.name
-        try:
-            dst.write_text(src.read_text())
-            log.info("provisioned subagent: %s", dst)
-        except OSError:
-            log.exception("could not provision subagent %s", src)
+    log.debug("provision_subagents: no-op (ADK runner reads agents directly)")

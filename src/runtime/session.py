@@ -5,32 +5,22 @@ A `SamSession` is one wake-up: take an incoming Slack message, hand it to an
 can use to decide what reactions to add and whether to retry.
 
 The `AgentRunner` Protocol is the swap point. The default implementation
-`ClaudeCodeAgentRunner` shells out to the Claude Code CLI. Future runners
-(smol-agents, OpenAI Agents, anything else with a CLI-or-API surface) can
-implement the same protocol — `SamSession` doesn't care which one it gets.
+`ADKAgentRunner` (in .adk_runner) runs Sam via Google ADK + Vertex Gemini.
 
 Imports from .config and .prompts. Imported by .daemon.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import os
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Protocol
 
 from .config import (
-    MAX_SESSION_SECONDS,
-    SAM_MODEL,
     SAM_REPO,
-    STDERR_TAIL_LINES,
-    STUCK_TIMEOUT_SECONDS,
-    SYNTHETIC_ERRORS_MAX,
     journal_path_for_today,
     log,
     redact_secrets,
@@ -278,156 +268,16 @@ class AgentRunResult:
 class AgentRunner(Protocol):
     """Swap point for the agentic framework Sam runs on.
 
-    Default implementation: ClaudeCodeAgentRunner. Implementations should
-    handle their own stuck/timeout detection and surface results in the
-    common AgentRunResult shape so SamSession doesn't have to care which
-    backend it got.
+    Default implementation: ADKAgentRunner (google.adk + Vertex Gemini).
+    Any class with a compatible run() method satisfies this protocol.
     """
 
     async def run(self, request: AgentRunRequest) -> AgentRunResult: ...
 
 
-class ClaudeCodeAgentRunner:
-    """Runs an agent session by spawning the Claude Code CLI subprocess.
-
-    Reads stream-json on stdout, captures tool_use records, scrapes synthetic
-    error messages (Claude-Code-specific signal Sam uses for retry-session
-    briefing), and watches for stuck / timed-out conditions. Kills the
-    subprocess if either tripwire fires.
-    """
-
-    def __init__(self) -> None:
-        self._proc: Optional[asyncio.subprocess.Process] = None
-        self._last_output_at: float = 0.0
-
-    async def run(self, request: AgentRunRequest) -> AgentRunResult:
-        started_at = time.monotonic()
-        started_at_wall = time.time()
-        self._last_output_at = started_at
-
-        stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
-        synthetic_errors: deque[str] = deque(maxlen=SYNTHETIC_ERRORS_MAX)
-        tool_use_records: list[ToolUseRecord] = []
-
-        user_input = json.dumps({
-            "type": "user",
-            "message": {"role": "user", "content": request.initial_user_message}
-        }) + "\n"
-
-        cmd = [
-            "claude",
-            "-p",                                  # print/non-interactive
-            "--verbose",                           # required by -p + stream-json output
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-            "--include-partial-messages",
-        ]
-        if request.model:
-            cmd.extend(["--model", request.model])
-        cmd.extend(["--system-prompt", request.system_prompt])
-        cmd.extend(["--allowed-tools", ",".join(request.allowed_tools)])
-
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=request.env or os.environ.copy(),
-            cwd=request.cwd,
-        )
-
-        assert self._proc.stdin is not None
-        self._proc.stdin.write(user_input.encode())
-        await self._proc.stdin.drain()
-        self._proc.stdin.close()
-
-        stuck = False
-        timed_out = False
-
-        async def read_stdout() -> None:
-            assert self._proc and self._proc.stdout
-            async for line in self._proc.stdout:
-                self._last_output_at = time.monotonic()
-                raw = line.decode().strip()
-                if not raw:
-                    continue
-                log.debug("stdout: %s", raw[:200])
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") != "assistant":
-                    continue
-                msg = event.get("message") or {}
-                content_blocks = msg.get("content") or []
-                if msg.get("model") == "<synthetic>":
-                    for block in content_blocks:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = (block.get("text") or "").strip()
-                            if text:
-                                synthetic_errors.append(text[:1000])
-                                log.warning("synthetic error: %s", text[:200])
-                    continue
-                for block in content_blocks:
-                    if not isinstance(block, dict) or block.get("type") != "tool_use":
-                        continue
-                    tool_use_records.append(ToolUseRecord(
-                        name=block.get("name") or "",
-                        input=block.get("input") or {},
-                    ))
-
-        async def read_stderr() -> None:
-            assert self._proc and self._proc.stderr
-            async for line in self._proc.stderr:
-                self._last_output_at = time.monotonic()
-                text = line.decode().rstrip()[:500]
-                stderr_tail.append(text)
-                log.warning("stderr: %s", text[:200])
-
-        async def watch_stuck() -> None:
-            nonlocal stuck, timed_out
-            while self._proc and self._proc.returncode is None:
-                await asyncio.sleep(30)
-                elapsed = time.monotonic() - started_at
-                idle = time.monotonic() - self._last_output_at
-                if elapsed > MAX_SESSION_SECONDS:
-                    log.warning("session exceeded max wall time, killing")
-                    timed_out = True
-                    self._kill()
-                    return
-                if idle > STUCK_TIMEOUT_SECONDS:
-                    log.warning("session stuck (no output for %ds), killing", int(idle))
-                    stuck = True
-                    self._kill()
-                    return
-
-        await asyncio.gather(
-            read_stdout(), read_stderr(), watch_stuck(),
-            return_exceptions=True,
-        )
-
-        exit_code = await self._proc.wait()
-        ended_at = time.monotonic()
-
-        return AgentRunResult(
-            exit_code=exit_code,
-            started_at=started_at,
-            started_at_wall=started_at_wall,
-            ended_at=ended_at,
-            last_output_at=self._last_output_at,
-            stuck=stuck,
-            timed_out=timed_out,
-            stderr_tail=list(stderr_tail),
-            synthetic_errors=list(synthetic_errors),
-            tool_use_records=tool_use_records,
-        )
-
-    def _kill(self) -> None:
-        if self._proc and self._proc.returncode is None:
-            try:
-                self._proc.kill()
-            except ProcessLookupError:
-                pass
+# ADKAgentRunner is defined in .adk_runner and imported below.
+# It is the sole default runner — ClaudeCodeAgentRunner has been removed.
+# To restore the old Claude Code runner, see git history.
 
 # -----------------------------------------------------------------------------
 # SamSession — orchestrates one wake-up using a chosen AgentRunner
@@ -441,23 +291,23 @@ class SessionResult:
 
     Reaction flags are independent — any combination can fire on a given
     session:
-    - opus_used     → :brain:
+    - arc_used      → :brain:
     - web_used      → :globe_with_meridians:
     - bash_used     → :computer:
     - edited_files  → :gear:
     """
     session_id: str
     started_at: float
-    started_at_wall: float        # time.time() at subprocess launch — for Slack history queries
+    started_at_wall: float        # time.time() at runner launch — for Slack history queries
     ended_at: float
     exit_code: Optional[int]
     last_output_at: float
     stuck: bool
     timed_out: bool
-    opus_used: bool = False       # Agent tool dispatched to opus
-    web_used: bool = False        # WebFetch or WebSearch was used
-    bash_used: bool = False       # Bash used for non-Slack-housekeeping work (git, gh, curl, etc.)
-    edited_files: bool = False    # Edit/Write to a path outside /data/journal/
+    arc_used: bool = False        # arc subagent (big model) was dispatched
+    web_used: bool = False        # fetch_url or web search was used
+    bash_used: bool = False       # bash used for non-Slack-housekeeping work (git, gh, curl, etc.)
+    edited_files: bool = False    # write_file/edit_file touched a path outside /data/journal/
     stderr_tail: list[str] = field(default_factory=list)
     synthetic_errors: list[str] = field(default_factory=list)
 
@@ -471,13 +321,12 @@ class SamSession:
 
     Reads identity/scope/capabilities/skills fresh, builds the system prompt,
     hands the request to an `AgentRunner`, and translates the runner result
-    into a `SessionResult`. Default runner is ClaudeCodeAgentRunner; pass a
-    different `AgentRunner` to swap the backend.
+    into a `SessionResult`. Default runner is ADKAgentRunner (Vertex Gemini).
     """
 
     DEFAULT_ALLOWED_TOOLS: list[str] = [
-        "Bash", "Read", "Write", "Edit", "Grep", "Glob",
-        "WebFetch", "WebSearch", "Agent",
+        "bash", "read_file", "write_file", "edit_file", "grep", "glob_files",
+        "fetch_url", "arc",
     ]
 
     def __init__(
@@ -487,7 +336,10 @@ class SamSession:
     ):
         self.message = message
         self.session_id = uuid.uuid4().hex[:12]
-        self.agent_runner: AgentRunner = agent_runner or ClaudeCodeAgentRunner()
+        if agent_runner is None:
+            from .adk_runner import ADKAgentRunner
+            agent_runner = ADKAgentRunner()
+        self.agent_runner: AgentRunner = agent_runner
 
     async def run(self) -> SessionResult:
         log.info(
@@ -499,7 +351,6 @@ class SamSession:
             system_prompt=assemble_system_prompt(),
             initial_user_message=self.message.to_initial_user_message(),
             allowed_tools=self.DEFAULT_ALLOWED_TOOLS,
-            model=SAM_MODEL,
             cwd=str(SAM_REPO),
             env=os.environ.copy(),
         )
@@ -512,7 +363,7 @@ class SamSession:
             agent_result.stuck, agent_result.timed_out,
         )
 
-        opus_used, web_used, bash_used, edited_files = self._classify_tool_use(
+        arc_used, web_used, bash_used, edited_files = self._classify_tool_use(
             agent_result.tool_use_records,
         )
 
@@ -525,7 +376,7 @@ class SamSession:
             last_output_at=agent_result.last_output_at,
             stuck=agent_result.stuck,
             timed_out=agent_result.timed_out,
-            opus_used=opus_used,
+            arc_used=arc_used,
             web_used=web_used,
             bash_used=bash_used,
             edited_files=edited_files,
@@ -544,44 +395,44 @@ class SamSession:
     def _classify_tool_use(
         records: list[ToolUseRecord],
     ) -> tuple[bool, bool, bool, bool]:
-        """Return (opus_used, web_used, bash_used, edited_files) for the
+        """Return (arc_used, web_used, bash_used, edited_files) for the
         post-session badges.
 
-        - opus_used    = Agent tool dispatched to subagent_type=opus.
-        - web_used     = WebFetch or WebSearch was used.
-        - bash_used    = Bash used for non-Slack-housekeeping work (Bash
+        ADK tool names (function names from adk_runner.py):
+        - arc_used     = AgentTool "arc" was dispatched (big model).
+        - web_used     = fetch_url was called.
+        - bash_used    = bash was called for non-Slack-housekeeping work (bash
           calls whose command contains "slack.com" are post/react/reply
           calls and don't count).
-        - edited_files = Edit or Write touched a path outside `/data/journal/`.
-          Routine journal entries are written by every session and would
-          make this flag meaningless if they counted.
+        - edited_files = write_file or edit_file touched a path outside
+          /data/journal/. Routine journal entries are written by every session
+          and would make this flag meaningless if they counted.
 
-        Read-only tools (Read, Grep, Glob) are pure context-gathering and
-        don't drive any badge. Each flag drives one independent emoji on
+        Read-only tools (read_file, grep, glob_files) are pure context-gathering
+        and don't drive any badge. Each flag drives one independent emoji on
         Sam's response; any combination can fire on a given session.
         """
-        opus_used = False
+        arc_used = False
         web_used = False
         bash_used = False
         edited_files = False
         for record in records:
             name = record.name
             input_dict = record.input or {}
-            if name == "Agent":
-                if input_dict.get("subagent_type") == "opus":
-                    opus_used = True
-            elif name in ("WebFetch", "WebSearch"):
+            if name == "arc":
+                arc_used = True
+            elif name == "fetch_url":
                 web_used = True
-            elif name == "Bash":
+            elif name == "bash":
                 command = input_dict.get("command") or ""
                 if "slack.com" not in command:
                     bash_used = True
-            elif name in ("Edit", "Write"):
+            elif name in ("write_file", "edit_file"):
                 file_path = input_dict.get("file_path") or ""
                 if not file_path.startswith("/data/journal/"):
                     edited_files = True
-            # Read, Grep, Glob: read-only context gathering, doesn't count.
-        return opus_used, web_used, bash_used, edited_files
+            # read_file, grep, glob_files: read-only, no badge.
+        return arc_used, web_used, bash_used, edited_files
 
     def _safety_net_journal_entry(self, result: SessionResult) -> None:
         """Append a minimal journal entry when something went wrong.
