@@ -28,12 +28,14 @@ Code layout:
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 import time
 from datetime import datetime
 from typing import Optional
 
+from aiohttp import web
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
@@ -847,6 +849,12 @@ class Daemon:
             except Exception:
                 log.exception("conversations.info failed; side-pane redirect will use a generic phrase")
 
+        # Cloud Run startup probe requires an HTTP server on $PORT before the
+        # revision is marked healthy. Sam is otherwise outbound-only (Slack
+        # Socket Mode), so we expose a tiny aiohttp 200-OK endpoint just for
+        # the platform contract. No-op when PORT isn't set (local docker compose).
+        healthcheck_runner = await self._start_healthcheck_server()
+
         worker_task = asyncio.create_task(self._worker())
         socket_task = asyncio.create_task(self.handler.start_async())
         # Run catch-up after socket starts so live events have a path in,
@@ -880,6 +888,38 @@ class Daemon:
                 await t
             except (asyncio.CancelledError, Exception):  # noqa: S110  # shutdown cleanup; logging would be noise
                 pass
+        if healthcheck_runner is not None:
+            await healthcheck_runner.cleanup()
+
+    async def _start_healthcheck_server(self) -> Optional[web.AppRunner]:
+        """Start a minimal HTTP server so Cloud Run's startup probe passes.
+
+        Cloud Run services require the container to listen on $PORT — Sam
+        itself is outbound-only (Slack Socket Mode), so this server exists
+        purely to satisfy the platform contract. If PORT isn't set (local
+        docker compose), we skip and run as before.
+        """
+        port_env = os.getenv("PORT")
+        if not port_env:
+            return None
+        try:
+            port = int(port_env)
+        except ValueError:
+            log.warning("PORT=%r is not an integer; skipping healthcheck server", port_env)
+            return None
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application()
+        app.router.add_get("/", _ok)
+        app.router.add_get("/healthz", _ok)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=port)  # noqa: S104  # Cloud Run requires 0.0.0.0
+        await site.start()
+        log.info("healthcheck HTTP server listening on :%d", port)
+        return runner
 
 # -----------------------------------------------------------------------------
 # Entrypoint

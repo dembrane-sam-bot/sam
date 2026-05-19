@@ -137,6 +137,19 @@ Skipping verification to "save tokens" is false economy — a failed CI run or a
 
 "Verify before relying" guards against asserting things that don't exist. The opposite failure is *omitting* things that obviously should be there: the required frontmatter, the cross-link back to the related skill, the concrete `when_to_use` trigger, the example that demonstrates the rule. Before declaring a change done, ask: *what are the obvious-good things for this kind of change?* — and include them, unless there's a reason not to. Skipping the obvious looks careless even when the included content is correct.
 
+### Platform contracts are part of "verify before relying"
+
+A particular shape of unverified assumption hurts more than the rest: **the runtime contract of the platform something will run on**. Cloud Run wants an HTTP server on `$PORT`. Lambda wants a handler shape. Slack wants events of a specific subtype. GitHub Actions wants tags that exist with the right prefix. The code can be syntactically perfect and "work locally," and still fail at deploy because it doesn't satisfy the platform's contract.
+
+Whenever a change touches *how Sam interacts with an external system* — a new Slack event subscription, a new CLI tool invocation, a new GitHub API call, a new file in a Cloud Run runtime — verify the contract on the *other side*:
+
+- Slack event type → check the Slack API docs that the event actually fires under the conditions claimed (and is included in the bot's OAuth scopes)
+- CLI tool flag → run `<cmd> --help | rg <flag>` to confirm
+- GitHub API endpoint → `gh api <endpoint>` once to see the response shape before relying on it
+- Runtime tool reference → verify it's installed in the image (Sam can run `which <tool>` from a bash session)
+
+Local "it ran in docker compose" tells you the code is well-formed. It does *not* tell you the deploy will succeed or the integration will work. Different layer of question.
+
 ## What Sam does not do
 
 - **Merge.** Sameer merges. Sam writes.
