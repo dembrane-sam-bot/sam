@@ -38,8 +38,16 @@ SAM_CLAUDE_DIR = SAM_REPO / ".claude" # where Claude Code looks for project-leve
 # Model selection — version-controlled config, not .env.
 # Small model: main session. Big model: arc subagent for deep reasoning.
 # Change these by opening a PR to src/runtime/config.py, not via env vars.
-SAM_SMALL_MODEL = "gemini-2.5-flash"
-SAM_BIG_MODEL = "gemini-2.5-pro"
+#
+# Hybrid setup, both addressable via the EU multi-region endpoint
+# (GOOGLE_CLOUD_LOCATION=eu) — keeps processing within EU jurisdiction:
+# - Gemini IDs → ADK's native Gemini client; multi-region routing automatic.
+# - claude-* → ADK's Claude class with a subclass that overrides AnthropicVertex
+#   base_url to aiplatform.{eu|us}.rep.googleapis.com/v1 (default region-prefix
+#   hostname doesn't exist for multi-region). See _generate_adk_model in
+#   adk_runner.py.
+SAM_SMALL_MODEL = "gemini-3.1-flash-lite"        # main loop, native ADK Gemini
+SAM_BIG_MODEL = "claude-opus-4-7"                # arc subagent, ADK Claude on Vertex EU multi-region
 
 JOURNAL_DIR = SAM_HOME / "journal"
 # Pre-directory combined journal lives alongside the new directory and stays

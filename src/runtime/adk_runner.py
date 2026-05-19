@@ -1,10 +1,13 @@
 """ADK agent runner for Sam.
 
-Implements the AgentRunner Protocol using Google's Agent Development Kit (ADK)
-with Vertex AI Gemini models.
+Implements the AgentRunner Protocol using Google's Agent Development Kit
+(ADK) with a hybrid model setup on Vertex AI's EU multi-region endpoint:
+  - Main loop: Gemini 3.1 Flash-Lite via ADK's native Gemini client.
+  - Arc subagent: Anthropic Claude Opus 4.7 via ADK's Claude class, with a
+    subclass that injects the correct multi-region base_url for AnthropicVertex.
 
 Architecture:
-  main agent — SAM_SMALL_MODEL (gemini flash)
+  main agent — SAM_SMALL_MODEL (Gemini 3.1 Flash-Lite, native ADK)
     ├── bash                    run shell commands
     ├── read_file               read files from disk
     ├── write_file              write files to disk
@@ -12,7 +15,7 @@ Architecture:
     ├── grep                    search file contents
     ├── glob_files              find files by pattern
     ├── fetch_url               fetch a URL and return content
-    ├── arc                     AgentTool → arc agent (SAM_BIG_MODEL, single task)
+    ├── arc                     AgentTool → arc agent (SAM_BIG_MODEL = Claude Opus 4.7, single task)
     │                               ├── read_file
     │                               ├── grep
     │                               ├── glob_files
@@ -21,9 +24,11 @@ Architecture:
                                     each branch gets its own LlmAgent + InMemorySession
                                     results returned labeled and concatenated
 
-Vertex AI auth: set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, and
-GOOGLE_APPLICATION_CREDENTIALS (or use workload identity) in the environment.
-The google-genai SDK picks these up automatically.
+Vertex AI auth: set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, and either
+GOOGLE_APPLICATION_CREDENTIALS or ADC (gcloud auth application-default login)
+in the environment. ADK's Gemini client picks up location for multi-region
+routing automatically; LiteLLM gets project/location/api_base via explicit
+kwargs we pass in `_generate_adk_model`.
 
 Session flow: one Runner per call to run(). Sessions are ephemeral
 (InMemorySessionService). Stuck/timeout detection mirrors
@@ -248,6 +253,78 @@ def _load_arc_instruction() -> str:
     return text.strip()
 
 
+# ─── Model routing ────────────────────────────────────────────────────────────
+
+
+def _generate_adk_model(model_id: str):
+    """Return whatever `LlmAgent(model=...)` should receive for this model ID.
+
+    Two paths:
+    - `claude-*` → returns an ADK `Claude` instance with a subclass that
+      injects the correct `base_url` for EU/US multi-region endpoints.
+      Stock ADK uses AnthropicVertex's default `{region}-aiplatform.googleapis.com`
+      hostname, which doesn't exist for multi-region values like "eu";
+      the working host is `aiplatform.{region}.rep.googleapis.com/v1`.
+    - Anything else (Gemini) → return the plain string; ADK's native Gemini
+      client handles routing, including EU multi-region.
+
+    Both paths read project/location from `GOOGLE_CLOUD_PROJECT` /
+    `GOOGLE_CLOUD_LOCATION` so the .env stays single-source. Lazy-imports
+    keep the module loadable in test envs where google-adk isn't installed.
+    """
+    if not model_id.startswith("claude-"):
+        # Native ADK Gemini — pass through.
+        return model_id
+
+    from functools import cached_property
+    from anthropic import AsyncAnthropicVertex
+    from google.adk.models.anthropic_llm import Claude, get_tracking_headers
+
+    class _ClaudeMultiRegion(Claude):
+        @cached_property
+        def _anthropic_client(self) -> AsyncAnthropicVertex:
+            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+            location = os.environ.get("GOOGLE_CLOUD_LOCATION")
+            if not project_id or not location:
+                raise RuntimeError(
+                    "GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION must be "
+                    "set for Vertex AI Claude. See .env.example."
+                )
+            kwargs = {
+                "project_id": project_id,
+                "region": location,
+                "default_headers": get_tracking_headers(),
+            }
+            if location in ("eu", "us"):
+                kwargs["base_url"] = (
+                    f"https://aiplatform.{location}.rep.googleapis.com/v1"
+                )
+            client = AsyncAnthropicVertex(**kwargs)
+
+            # Ephemeral prompt-cache the system prompt. ADK passes system
+            # as a plain string; Anthropic also accepts a structured
+            # [{text, cache_control}] form. Sam's system prompt is large
+            # and stable across turns within a session — caching reads
+            # the prior tokens at ~10% of base cost on subsequent calls
+            # within the 5-min ephemeral window.
+            original_create = client.messages.create
+
+            async def _create_with_cache(**call_kwargs):
+                sys = call_kwargs.get("system")
+                if isinstance(sys, str) and sys:
+                    call_kwargs["system"] = [{
+                        "type": "text",
+                        "text": sys,
+                        "cache_control": {"type": "ephemeral"},
+                    }]
+                return await original_create(**call_kwargs)
+
+            client.messages.create = _create_with_cache
+            return client
+
+    return _ClaudeMultiRegion(model=model_id)
+
+
 # ─── Parallel arc fan-out ─────────────────────────────────────────────────────
 
 
@@ -285,7 +362,7 @@ def _make_parallel_arc_tool(arc_instruction: str):
         async def run_one(task: str, idx: int) -> str:
             arc = LlmAgent(
                 name=f"arc_{idx}",
-                model=SAM_BIG_MODEL,
+                model=_generate_adk_model(SAM_BIG_MODEL),
                 instruction=arc_instruction,
                 tools=[
                     FunctionTool(func=read_file),
@@ -385,7 +462,7 @@ class ADKAgentRunner:
         # Arc — the big model, read-only.
         arc_agent = LlmAgent(
             name="arc",
-            model=SAM_BIG_MODEL,
+            model=_generate_adk_model(SAM_BIG_MODEL),
             instruction=arc_instruction,
             tools=ro_tools,
         )
@@ -396,7 +473,7 @@ class ADKAgentRunner:
         # Main — small model, full tools including single-arc and fan-out.
         main_agent = LlmAgent(
             name="sam",
-            model=SAM_SMALL_MODEL,
+            model=_generate_adk_model(SAM_SMALL_MODEL),
             instruction=request.system_prompt,
             tools=[
                 FunctionTool(func=bash_tool),

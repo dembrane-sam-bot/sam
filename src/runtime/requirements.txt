@@ -1,7 +1,12 @@
 slack-bolt==1.21.2
 slack-sdk==3.33.4
 aiohttp==3.10.10
-httpx==0.27.2
+httpx==0.28.1
 python-dotenv==1.0.1
 croniter==2.0.5
-google-adk
+# Agent runtime
+google-adk==1.34.0
+# Anthropic SDK with Vertex extras — used by ADK's Claude class for Claude
+# on Vertex. We subclass Claude in adk_runner.py to inject the multi-region
+# base_url that AnthropicVertex doesn't infer on its own.
+anthropic[vertex]==0.103.0
