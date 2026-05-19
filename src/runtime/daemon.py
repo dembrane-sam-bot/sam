@@ -39,11 +39,12 @@ from slack_bolt.async_app import AsyncApp
 
 from .config import (
     ALLOWED_MESSAGE_SUBTYPES,
+    BIG_MODEL,
     COMMIT_SHA,
     LockError,
     NOISY_MESSAGE_SUBTYPES,
     SAM_CHANNEL,
-    SAM_MODEL,
+    SMALL_MODEL,
     SAM_OPERATOR_USER_ID,
     SLACK_APP_TOKEN,
     SLACK_BOT_TOKEN,
@@ -863,8 +864,8 @@ class Daemon:
             log.info("no skills with `cron:` frontmatter; no scheduled tasks running")
 
         log.info(
-            "Sam daemon ready (channel=%s, commit=%s, model=%s)",
-            SAM_CHANNEL or "all", COMMIT_SHA or "unknown", SAM_MODEL,
+            "Sam daemon ready (channel=%s, commit=%s, runner=adk, small=%s, big=%s)",
+            SAM_CHANNEL or "all", COMMIT_SHA or "unknown", SMALL_MODEL, BIG_MODEL,
         )
 
         await self.shutdown_event.wait()

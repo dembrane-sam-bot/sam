@@ -158,6 +158,16 @@ Rule of thumb: if Sam should know it on every message, it's a capability. If Sam
 
 Every session writes a journal entry to today's file at `/data/journal/<YYYY-MM-DD>.md` describing what happened. Legacy history in `/data/journal.md` remains for continuity during migration. Format is in `src/capabilities/journal.md`. Don't skip writing one, even on small sessions.
 
+## Env var discipline
+
+Two buckets — and they're not interchangeable:
+
+- **`.env` (not version-controlled):** sensitive or deployment-specific values — API keys, project IDs, credentials, tokens. `LINEAR_API_KEY`, `SLACK_BOT_TOKEN`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, `GOOGLE_GENAI_USE_VERTEXAI`. Things that differ between deployments or that must stay out of git.
+
+- **`src/runtime/config.py` (version-controlled):** everything else. Model names (`SMALL_MODEL`, `BIG_MODEL`), timing knobs, buffer sizes, runner behavior. If changing a value warrants a PR, it belongs here. If it belongs in a PR, it belongs here.
+
+The test: would a future reviewer want to see this change in git history? If yes, it's config.py. If it's a secret or changes per-deployment, it's .env.
+
 ## Design rule when proposing a new mechanism
 
 **Reuse existing routines before building a new mechanism.** When something needs to happen on a recurring or reactive basis (canvas reconciliation, journal pruning, status checks, anything that wakes Sam to do work), first look at the routines that already exist — `daily-maintenance` at 22:00, other cron skills, the existing Slack event handlers in the daemon, sessions that already run for related reasons. If an existing routine can absorb the new behavior, extend that routine; don't introduce a parallel mechanism. *Only* when no existing routine fits should the question of "new mechanism" arise. When it does, prefer event-driven (subscribing to an upstream signal in the daemon) over polling (a new cron skill); polling burns wake-ups on no-ops and introduces lag. Event subscriptions live in the daemon (Tier 3), so raising the need to Sameer is part of the proposal — don't silently default to a cron skill because it's the only thing Sam can self-PR.

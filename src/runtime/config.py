@@ -33,11 +33,12 @@ SAM_OPERATOR_USER_ID = os.environ.get("SAM_OPERATOR_USER_ID")  # @-mentioned whe
 SAM_HOME = Path(os.environ.get("SAM_HOME", "/data"))
 SAM_REPO = Path("/home/sam")          # where Sam's checkout lives in the container
 SAM_SRC = SAM_REPO / "src"            # identity, scope, capabilities, skills, runtime
-SAM_CLAUDE_DIR = SAM_REPO / ".claude" # where Claude Code looks for project-level config
+SAM_CLAUDE_DIR = SAM_REPO / ".claude" # kept for historical reference; no longer actively used
 
-# Default model for Sam's main session. Sam dispatches to the opus subagent
-# (see src/runtime/agents/opus.md) when it wants deeper reasoning.
-SAM_MODEL = "sonnet"
+# Model selection — version-controlled here, not in .env.
+# Sensitive deployment config (project, location, credentials) stays in .env.
+SMALL_MODEL = "gemini-2.5-flash"   # main session — fast, used for all routine work
+BIG_MODEL = "gemini-2.5-pro"       # arc subagent — slower, deeper reasoning
 
 JOURNAL_DIR = SAM_HOME / "journal"
 # Pre-directory combined journal lives alongside the new directory and stays
@@ -215,27 +216,8 @@ def _read_commit_sha() -> Optional[str]:
 COMMIT_SHA: Optional[str] = _read_commit_sha()
 
 # -----------------------------------------------------------------------------
-# Subagent provisioning — mirror Tier 3 agent defs into the path Claude Code reads
+# Subagent provisioning — no-op with ADK runner (agents are Python objects)
 # -----------------------------------------------------------------------------
 
 def provision_subagents() -> None:
-    """Copy Tier 3 subagent definitions into the place Claude Code looks for them.
-
-    Subagent definitions live under `src/runtime/agents/` (Tier 3 — substrate,
-    not Sam-editable). Claude Code only auto-discovers agents under
-    `.claude/agents/`, so on each daemon start we mirror the substrate copies
-    into that runtime path. If a teammate (or Sam itself, accidentally)
-    overwrote one of those files between restarts, this restores it.
-    """
-    source_dir = SAM_SRC / "runtime" / "agents"
-    if not source_dir.exists():
-        return
-    target_dir = SAM_CLAUDE_DIR / "agents"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for src in sorted(source_dir.glob("*.md")):
-        dst = target_dir / src.name
-        try:
-            dst.write_text(src.read_text())
-            log.info("provisioned subagent: %s", dst)
-        except OSError:
-            log.exception("could not provision subagent %s", src)
+    """No-op. Kept for API compatibility; ADK agents are built in Python at runtime."""
