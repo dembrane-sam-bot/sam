@@ -1,0 +1,186 @@
+name: ci-deploy
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write   # required for Workload Identity Federation
+
+# Cancel in-progress runs on the same branch when a new push lands. Saves CI
+# minutes and avoids confusing "stale check passed" results on PRs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-checks:
+    # PR-only — gating happens before merge. Pushes to main are assumed to
+    # have already passed checks via the PR they came from (enforced by
+    # branch protection: see infra/README.md).
+    if: github.event_name == 'pull_request'
+    name: ci-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip   # caches pip downloads keyed on hashes of *.txt requirements
+
+      - name: Install Python tooling
+        run: pip install ruff==0.7.4 pip-audit==2.9.0
+
+      # ── Code quality ────────────────────────────────────────────────────
+      - name: Lint (ruff)
+        run: ruff check src/
+
+      # ── Python security ─────────────────────────────────────────────────
+      - name: Security lint (ruff bandit rules)
+        # S-prefix rules in ruff are a port of bandit. Catches subprocess with
+        # shell=True, eval, pickle, hardcoded passwords, weak hashing, etc.
+        # S101 (assert in tests) is fine for Sam — we use asserts intentionally.
+        run: ruff check src/ --select=S --ignore=S101
+
+      - name: Python dependency CVE scan (pip-audit)
+        # Fails on any known vulnerability in pinned deps. To ignore a specific
+        # one (e.g. unfixable upstream), add `--ignore-vuln GHSA-xxxx-xxxx-xxxx`.
+        run: pip-audit -r src/runtime/requirements.txt
+
+      # Secret scanning: deferred to GitHub's native secret scanning (free for
+      # public repos, auto-runs on every push, surfaces in repo Security tab).
+      # No CI minutes burned. Re-add gitleaks here if we ever go private again.
+
+      # ── Docker ─────────────────────────────────────────────────────────
+      - name: Set up Buildx (enables BuildKit cache)
+        uses: docker/setup-buildx-action@v4
+
+      - name: Docker build smoke test (with GHA cache)
+        # build-push-action with cache-from/to=gha hits BuildKit's GitHub
+        # Actions cache backend — cold build ~60s, cached ~10s. No push here,
+        # just verify it builds and load into local docker for trivy.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: sam:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container vulnerability scan (trivy)
+        # HIGH/CRITICAL only — LOW/MEDIUM are usually noisy/unfixable.
+        # ignore-unfixed skips CVEs upstream hasn't shipped a patch for yet.
+        # .trivyignore documents CVEs we deliberately accept (with rationale).
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: sam:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+          trivyignores: .trivyignore
+
+  deploy:
+    # Only on merges to main, never on PR runs. Doesn't depend on ci-checks
+    # because ci-checks is PR-only — by the time we're here, the merged
+    # commit already passed those checks on its source PR.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load deployment config
+        # Read infra/config.yaml (hand-edited) and infra/config.generated.yaml
+        # (terraform-written) into the job env. yq is preinstalled on ubuntu-latest.
+        run: |
+          set -euo pipefail
+          {
+            echo "PROJECT_ID=$(yq '.gcp_project_id' infra/config.yaml)"
+            echo "REGION=$(yq '.gcp_region' infra/config.yaml)"
+            echo "VERTEX_LOCATION=$(yq '.vertex_location' infra/config.yaml)"
+            echo "SLACK_CHANNEL=$(yq '.slack_channel' infra/config.yaml)"
+            echo "SLACK_OPERATOR_USER_ID=$(yq '.slack_operator_user_id' infra/config.yaml)"
+            echo "TIMEZONE=$(yq '.timezone' infra/config.yaml)"
+            echo "SAM_HOME=$(yq '.cloud_run.sam_home' infra/config.yaml)"
+            echo "MIN_INSTANCES=$(yq '.cloud_run.min_instances' infra/config.yaml)"
+            echo "MAX_INSTANCES=$(yq '.cloud_run.max_instances' infra/config.yaml)"
+            echo "MEMORY=$(yq '.cloud_run.memory' infra/config.yaml)"
+            echo "CPU=$(yq '.cloud_run.cpu' infra/config.yaml)"
+            echo "WIF_PROVIDER=$(yq '.gcp_wif_provider' infra/config.generated.yaml)"
+            echo "DEPLOY_SA=$(yq '.gcp_deploy_sa' infra/config.generated.yaml)"
+            echo "RUNTIME_SA=$(yq '.gcp_runtime_sa' infra/config.generated.yaml)"
+            echo "ARTIFACT_REGISTRY=$(yq '.gcp_artifact_registry' infra/config.generated.yaml)"
+            echo "DATA_BUCKET=$(yq '.gcs_data_bucket' infra/config.generated.yaml)"
+          } >> "$GITHUB_ENV"
+
+      - name: Compose runtime env-var string
+        run: |
+          ENV_VARS="GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
+          ENV_VARS="${ENV_VARS},GOOGLE_CLOUD_LOCATION=${VERTEX_LOCATION}"
+          ENV_VARS="${ENV_VARS},GOOGLE_GENAI_USE_VERTEXAI=true"
+          ENV_VARS="${ENV_VARS},SAM_CHANNEL=${SLACK_CHANNEL}"
+          ENV_VARS="${ENV_VARS},SAM_OPERATOR_USER_ID=${SLACK_OPERATOR_USER_ID}"
+          ENV_VARS="${ENV_VARS},SAM_HOME=${SAM_HOME}"
+          ENV_VARS="${ENV_VARS},TZ=${TIMEZONE}"
+          echo "ENV_VARS=${ENV_VARS}" >> "$GITHUB_ENV"
+
+      - name: Compose secret-mount string
+        run: |
+          SECRETS=$(yq '.secrets | to_entries | .[] | .key + "=" + .value + ":latest"' infra/config.yaml | paste -sd, -)
+          echo "SECRETS=${SECRETS}" >> "$GITHUB_ENV"
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image (with GHA cache)
+        # Shares the same gha cache as the PR-side ci-checks build, so a
+        # merge-to-main typically reuses layers from the last PR build.
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ env.ARTIFACT_REGISTRY }}/sam:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to Cloud Run
+        # --execution-environment=gen2 is required for cloud-storage volume mounts.
+        # --add-volume + --add-volume-mount mount the GCS data bucket at /data so
+        # Sam's journal survives restarts/redeploys.
+        run: |
+          gcloud run deploy sam \
+            --image="${ARTIFACT_REGISTRY}/sam:${GITHUB_SHA}" \
+            --region="${REGION}" \
+            --service-account="${RUNTIME_SA}" \
+            --execution-environment=gen2 \
+            --min-instances="${MIN_INSTANCES}" \
+            --max-instances="${MAX_INSTANCES}" \
+            --memory="${MEMORY}" \
+            --cpu="${CPU}" \
+            --no-allow-unauthenticated \
+            --set-env-vars="${ENV_VARS}" \
+            --set-secrets="${SECRETS}" \
+            --add-volume="name=sam-data,type=cloud-storage,bucket=${DATA_BUCKET}" \
+            --add-volume-mount="volume=sam-data,mount-path=${SAM_HOME}"

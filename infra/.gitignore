@@ -1,0 +1,20 @@
+# Local state, secrets, plan files. Anything Terraform generates locally.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Override files (per-operator)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Note: config.generated.yaml IS committed — it's the bridge between TF apply
+# and the CI workflow. Don't add it to this gitignore.

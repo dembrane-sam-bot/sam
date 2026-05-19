@@ -1,8 +1,8 @@
 slack-bolt==1.21.2
 slack-sdk==3.33.4
-aiohttp==3.10.10
+aiohttp==3.13.5     # bumped from 3.10.10 — pip-audit flagged 21 CVEs, all fixed in ≤3.13.4
 httpx==0.28.1
-python-dotenv==1.0.1
+python-dotenv==1.2.2  # bumped from 1.0.1 — GHSA-mf9w-mj56-hr94
 croniter==2.0.5
 # Agent runtime
 google-adk==1.34.0

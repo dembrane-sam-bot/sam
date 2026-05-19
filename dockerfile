@@ -1,8 +1,9 @@
 FROM python:3.12-slim
 
 # System packages: git for repo work, gh for GitHub API, ripgrep for grep tool,
-# curl/gnupg for the gh apt repo setup
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# curl/gnupg for the gh apt repo setup. `apt-get upgrade` picks up base-image
+# security patches that trivy would otherwise flag (e.g., libcap, libsystemd).
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
     curl \

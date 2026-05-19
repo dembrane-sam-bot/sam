@@ -1,0 +1,48 @@
+# Sam deployment config — single source of truth for all non-secret values.
+#
+# Both Terraform (infra/*.tf) and the CI workflow (.github/workflows/ci-deploy.yml)
+# read this file. Edit a value here → both pick it up on the next apply / deploy.
+#
+# Secret values (Slack tokens, GitHub PAT, Linear API key) live ONLY in GCP
+# Secret Manager — never in this repo. Populate them once via:
+#   bash infra/scripts/upload-secrets.sh
+
+# ── GCP project + regions ──────────────────────────────────────────────────
+gcp_project_id: dembrane-sameer-cli
+gcp_region: europe-west1     # Cloud Run + Artifact Registry (must be a specific EU region)
+vertex_location: eu          # Vertex AI multi-region literal — only Vertex understands "eu"
+
+# ── Slack identity  ────────────────────────────────
+slack_channel: C0B2VBYU79V
+slack_operator_user_id: U06G1DC1UMQ
+
+# ── Runtime ────────────────────────────────────────────────────────────────
+timezone: Europe/Amsterdam
+
+# ── GitHub repo allowed to deploy via WIF ──────────────────────────────────
+github_repo: Dembrane/sam
+# Numeric owner ID pins WIF to *this specific org account*. If the Dembrane
+# org were ever deleted, the name could be re-registered by anyone — but the
+# numeric ID can never be reissued. Fetch with: gh api orgs/<org> --jq .id
+github_owner_id: "157605218"
+
+# ── Cloud Run instance settings ────────────────────────────────────────────
+# Sam is single-instance by design (one daemon, one lock). Don't scale out.
+cloud_run:
+  min_instances: 1
+  max_instances: 1
+  memory: 1Gi
+  cpu: "1"
+  sam_home: /data
+
+# ── Secrets ────────────────────────────────────────────────────────────────
+# Mapping: <env var name Sam reads at runtime> → <secret ID in GCP Secret Manager>
+# TF creates these secret resources. Values are populated by upload-secrets.sh.
+# GITHUB_TOKEN is renamed to SAM_GITHUB_TOKEN in Secret Manager to avoid clashing
+# with the auto-injected GITHUB_TOKEN GitHub Actions provides.
+secrets:
+  SLACK_APP_TOKEN: SLACK_APP_TOKEN
+  SLACK_BOT_TOKEN: SLACK_BOT_TOKEN
+  SLACK_SIGNING_SECRET: SLACK_SIGNING_SECRET
+  GITHUB_TOKEN: SAM_GITHUB_TOKEN
+  LINEAR_API_KEY: LINEAR_API_KEY

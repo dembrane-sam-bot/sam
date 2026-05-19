@@ -1,0 +1,18 @@
+# CVEs trivy reports that we deliberately accept, with rationale.
+# Re-evaluate this file when the underlying packages get rebuilt with newer
+# Go / upstream fixes — these are not permanent ignores.
+
+# /usr/bin/gh (GitHub CLI) is compiled with an older Go stdlib (currently
+# v1.26.2) than what `--ignore-unfixed` would let through. The CVEs are all
+# DoS in code paths Sam doesn't exercise:
+#   - LookupCNAME via cgo resolver (Sam doesn't process untrusted DNS)
+#   - HTTP/2 SETTINGS infinite loop (Sam uses gh as a client, not server)
+#   - ParseAddress / consumePhrase on email input (Sam doesn't parse mail)
+#   - Dial NUL-byte panic on Windows (Sam runs on Linux)
+# Fix arrives when GitHub publishes a gh build linked against Go 1.26.3+ or
+# 1.25.10+. Until then, the affected paths are unreachable in our use.
+CVE-2026-33811
+CVE-2026-33814
+CVE-2026-39820
+CVE-2026-39836
+CVE-2026-42499

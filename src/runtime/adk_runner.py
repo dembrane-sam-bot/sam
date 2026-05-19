@@ -185,7 +185,9 @@ def grep(
             cmd.extend(["--glob", glob])
         if path:
             cmd.append(path)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        # noqa rationale: Sam is single-tenant; subprocess args are LLM-generated
+        # but the LLM also has bash access — there's no privilege boundary to defend here.
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)  # noqa: S603
         return (result.stdout or "(no matches)").rstrip()
     except subprocess.TimeoutExpired:
         return "(timed out)"

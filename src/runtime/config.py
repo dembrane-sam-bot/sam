@@ -214,8 +214,9 @@ def _read_commit_sha() -> Optional[str]:
     isn't a git checkout (e.g. running outside docker for tests).
     """
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+        # noqa rationale: static args, `git` is on PATH inside the container image.
+        result = subprocess.run(  # noqa: S603
+            ["git", "rev-parse", "--short", "HEAD"],  # noqa: S607
             capture_output=True, text=True, timeout=2, cwd=str(SAM_REPO),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):

@@ -878,7 +878,7 @@ class Daemon:
         for t in (*cron_tasks, catchup_task, socket_task, worker_task):
             try:
                 await t
-            except (asyncio.CancelledError, Exception):
+            except (asyncio.CancelledError, Exception):  # noqa: S110  # shutdown cleanup; logging would be noise
                 pass
 
 # -----------------------------------------------------------------------------

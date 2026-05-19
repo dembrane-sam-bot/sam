@@ -1,0 +1,43 @@
+# Without this file, `COPY . /home/sam/` in the Dockerfile pulls in EVERY
+# local file — including .env, .claude/, data/ — and bakes them into the
+# image. CI builds from a clean checkout are unaffected (these paths aren't
+# in git), but local builds were leaking secrets into images. Trivy caught it.
+
+# Secrets / runtime state — must never enter the image
+.env
+.env.*
+*.pem
+*.key
+*.p12
+.claude/
+data/
+
+# Git metadata — never needed at runtime
+.git/
+.gitignore
+.gitattributes
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Repo-level files not needed at runtime
+.github/
+infra/
+.dockerignore
+.trivyignore
+LICENSE
+README.md
+compose.yml
+docker-compose.yml

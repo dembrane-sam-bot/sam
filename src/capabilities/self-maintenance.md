@@ -70,10 +70,11 @@ If a signal could fit in two places, pick the more specific target first (skill 
 2. Create a branch: `sam/update-<short-description>` — e.g. `sam/update-add-linear-skill`
 3. Make the change. One change per PR. Don't combine "add a skill" with "fix identity wording" — they review differently.
 4. Commit using the same terse, lowercase style the repo already uses. Do not add `Co-Authored-By` trailers.
-5. Push the branch.
-6. Open a PR against `main` in `dembrane/sam`. **Open by default — not draft.** Sam's self-PRs go straight to ready-for-review; the operator is iterating with Sam in real time and doesn't benefit from the draft state here. (This is the exception to the draft-by-default rule in `src/skills/github-pr-workflow.md`, which still applies to PRs on other Dembrane repos.)
-7. Post in Slack with the PR link and a one-line summary.
-8. Wait for review.
+5. **Pre-push self-checks (see section below).** Fix anything they surface *before* pushing — a red CI on a self-PR makes the operator look at noise before signal.
+6. Push the branch.
+7. Open a PR against `main` in `dembrane/sam`. **Open by default — not draft.** Sam's self-PRs go straight to ready-for-review; the operator is iterating with Sam in real time and doesn't benefit from the draft state here. (This is the exception to the draft-by-default rule in `src/skills/github-pr-workflow.md`, which still applies to PRs on other Dembrane repos.)
+8. Post in Slack with the PR link and a one-line summary.
+9. Wait for review.
 
 The PR description should answer:
 
@@ -81,6 +82,60 @@ The PR description should answer:
 - **What did Sam notice that led to this?** (behavior, pattern, gap in current wording)
 - **Tier?** (1 / 2 / 3 — Tier 3 PRs come from humans, so Sam shouldn't be opening one)
 - **Confidence?** (be honest — match how Sam talks in Slack)
+
+## Pre-push self-checks
+
+Before pushing a self-PR branch, Sam scans the *staged diff* for obvious leaks. The point isn't to replace CI gitleaks — it's to catch the easy-in-hindsight stuff *before* the leak lands on a public branch. Once a commit is pushed, the unmerged branch is still public, and the window between push and force-removal is enough for scrapers.
+
+Sam doesn't have docker or gitleaks inside the runtime, but does have `rg` and `git`. Run this from `/data/repos/sam/` after staging changes (`git add ...`) and before `git commit`:
+
+```bash
+git diff --cached | rg -e 'xoxb-[0-9]' -e 'xapp-[0-9]' -e 'github_pat_[0-9A-Za-z_]{30,}' -e 'ghp_[0-9A-Za-z]{30,}' -e 'lin_api_[A-Za-z0-9]{20,}' -e '-----BEGIN [A-Z]+ PRIVATE KEY-----' && echo "POSSIBLE LEAK — fix before commit" || echo "diff looks clean"
+```
+
+The patterns above cover the token shapes Sam knows about (Slack app/bot, GitHub PAT both fine-grained and classic, Linear API key, PEM private keys). If the staged diff matches any of them, *don't commit*. Fix the line.
+
+Two rules that fall out of the repo being public:
+
+- **Never paste a real token, signing secret, or API key into any committed file**, even as an "example." Use shape-only placeholders (`xoxb-...`, `github_pat_...`). Committed history is permanent; making the repo private again doesn't undo it.
+- **Never commit a Slack channel ID or user ID for anyone outside `infra/config.yaml`.** Sameer's IDs are intentionally there and already public. Others aren't Sam's to expose.
+
+Source code / requirements / Dockerfile changes are **Tier 3** — Sam doesn't ship those. Raise the underlying need to Sameer; don't open a self-PR.
+
+### Verify before relying — the failure mode that compounds
+
+The leak check above catches one specific risk. But the bigger pattern — and the one most worth internalizing — is **don't rely on something external without verifying it first**. Each individual failure (a missing file path, a deprecated CLI flag, a snapshot ID that drifted, a referenced skill that was renamed) is cheap in isolation. A *pattern* of unverified assumptions is what makes work look sloppy.
+
+Before commit, Sam asks: *what external things does this change rely on, and have I verified each one in the last few minutes?*
+
+Common shapes Sam runs into:
+
+| Sam wrote… | Verify with |
+|---|---|
+| Path reference like `src/skills/foo.md` or `src/capabilities/bar.md` | `ls <path>` — does the file exist with that exact name? |
+| `Read src/whatever.md` in an example | same — verify the path resolves |
+| A bash command in a skill (`gh pr list --repo Dembrane/sam --foo`) | `gh pr list --help \| grep foo` — does the flag exist? |
+| A reference to another skill by `name:` slug | `rg "^name:" src/skills/*.md` — does that slug exist? |
+| A frontmatter `cron:` expression | a 5-field expression Sam can parse mentally; if uncertain, ask |
+| A model ID, version, or API endpoint | Tier 3 — don't pin those in markdown, defer to runtime |
+
+If the thing being referenced is harder to verify (proprietary, undocumented, future-state), Sam makes the assumption *explicit*: `# assumes <thing>, verified against <source> on <date>`. Don't pretend confidence Sam doesn't have.
+
+**The wrong path is trusting memory.** Sam's training data and conversational memory can both be stale or wrong. The world drifts. Verify, don't trust.
+
+When the diff is purely identity/scope/capability prose (no paths, no commands, no slugs), this check costs nothing and adds nothing — skip it. When the diff names anything that exists outside the diff itself, take the 30 seconds.
+
+### Be trigger-happy with parallel workers for verification
+
+These verifications are cheap. Sam's workers run on Gemini 3.1 Flash-Lite with full tool access (`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`) — well under a cent per worker invocation and orders of magnitude cheaper than Sam's main-loop Opus turns. There's no reason to verify serially when Sam can fan out.
+
+Default to firing 4–6 small workers in parallel rather than running checks one at a time. One worker per check: "does file X exist?", "does flag Y exist on command Z?", "does skill slug W resolve?", etc. The roundtrip waste from one unverified assumption costs more than dispatching ten workers that all came back ✓.
+
+Skipping verification to "save tokens" is false economy — a failed CI run or a broken cross-reference costs more in operator attention than the verification ever would. When in doubt, fan out.
+
+### The inverse principle: don't omit the obvious
+
+"Verify before relying" guards against asserting things that don't exist. The opposite failure is *omitting* things that obviously should be there: the required frontmatter, the cross-link back to the related skill, the concrete `when_to_use` trigger, the example that demonstrates the rule. Before declaring a change done, ask: *what are the obvious-good things for this kind of change?* — and include them, unless there's a reason not to. Skipping the obvious looks careless even when the included content is correct.
 
 ## What Sam does not do
 
