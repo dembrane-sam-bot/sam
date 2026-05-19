@@ -5,6 +5,14 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # merge_group fires when a PR is added to the merge queue. The workflow runs
+  # against a merge-candidate ref (PR commits rebased onto the queue head).
+  # ci-checks must pass on BOTH pull_request (branch-protection requirement on
+  # the PR head) AND merge_group (the queue's pre-merge validation). The
+  # double-run is GitHub's design — we can't elide either side without losing
+  # protection. Mitigations: cache layers (BuildKit GHA cache) and concurrency
+  # cancellation to keep the cost down.
+  merge_group:
 
 permissions:
   contents: read
@@ -18,10 +26,10 @@ concurrency:
 
 jobs:
   ci-checks:
-    # PR-only — gating happens before merge. Pushes to main are assumed to
-    # have already passed checks via the PR they came from (enforced by
-    # branch protection: see infra/README.md).
-    if: github.event_name == 'pull_request'
+    # Fire on PR (gates merge eligibility per branch protection) and on
+    # merge_group (gates queue release). Skip on push to main since the
+    # commits already passed both prior checks on their way through the queue.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     name: ci-checks
     runs-on: ubuntu-latest
     timeout-minutes: 15

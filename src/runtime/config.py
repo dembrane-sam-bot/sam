@@ -143,7 +143,18 @@ class LockError(Exception):
 
 
 def acquire_lock() -> None:
-    """Acquire the daemon-level lock. Refuses to start a second daemon."""
+    """Acquire the daemon-level lock. Refuses to start a second daemon.
+
+    On Cloud Run, single-instance is already enforced by `--min-instances=1
+    --max-instances=1`. The file lock is incorrect there: every container
+    is PID 1 in its own namespace, so a stale lock from a previous revision
+    (preserved on the gcsfuse-mounted /data) always looks "alive" to the
+    new container's `os.kill(pid, 0)` check, and the new daemon refuses to
+    start. Detect Cloud Run via K_SERVICE and skip.
+    """
+    if os.getenv("K_SERVICE"):
+        log.info("on Cloud Run (K_SERVICE=%s); single-instance enforced by platform, skipping file lock", os.getenv("K_SERVICE"))
+        return
     if LOCK_PATH.exists():
         try:
             pid = int(LOCK_PATH.read_text().strip())
@@ -160,6 +171,8 @@ def acquire_lock() -> None:
 
 
 def release_lock() -> None:
+    if os.getenv("K_SERVICE"):
+        return
     LOCK_PATH.unlink(missing_ok=True)
 
 
