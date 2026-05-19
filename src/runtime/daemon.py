@@ -11,7 +11,7 @@ Responsibilities:
   whitelisted channel
 - On startup, replay messages missed while the daemon was offline
 - Maintain a single-instance lock and a journal safety net
-- Add lifecycle reactions (:eyes: ack, :brain:/:gear: post-session) to Slack messages
+- Run a per-message reaction lifecycle (:eyes: ack at queue-time → :hourglass_flowing_sand: while Sam is working → :white_check_mark: on success / :x: on operator-alert) and badge Sam's response with :brain:/:globe:/:computer:/:gear: post-session
 
 What this daemon does NOT do:
 - Reason about anything. All reasoning happens inside Sam (the agent session).
@@ -256,6 +256,7 @@ class Daemon:
             is_principal_operator=first.is_principal_operator,
             raw_event=first.raw_event,
             thread_history=first.thread_history,
+            batched_event_ts=[m.event_ts for m in batch],
         )
 
     async def _fetch_thread_history(
@@ -387,6 +388,11 @@ class Daemon:
         when there's a backlog and the message sits in the queue for a while.
         Best-effort: `already_reacted` (double-fire on dedup races) and
         `message_not_found` are both non-fatal — log and move on.
+
+        Lifecycle: :eyes: is the ack; the worker later swaps it for
+        :hourglass_flowing_sand: when the session starts, then for either
+        :white_check_mark: (success) or :x: (operator-alert) at terminal
+        state. See `_mark_lifecycle`.
         """
         try:
             await self.app.client.reactions_add(
@@ -394,6 +400,51 @@ class Daemon:
             )
         except Exception as e:
             log.debug("reactions.add failed for %s/%s: %s", channel, ts, e)
+
+    async def _react_swap(
+        self, channel: str, ts: str, remove: Optional[str], add: Optional[str],
+    ) -> None:
+        """Best-effort reaction swap on a single message ts.
+
+        Removes one reaction name, adds another. Either side can be None to
+        skip that half. `no_reaction`, `already_reacted`, `message_not_found`
+        are all logged at debug and otherwise swallowed — reactions are UX
+        polish, not correctness.
+        """
+        if remove:
+            try:
+                await self.app.client.reactions_remove(
+                    channel=channel, timestamp=ts, name=remove,
+                )
+            except Exception as e:
+                log.debug("reactions.remove %s on %s/%s: %s", remove, channel, ts, e)
+        if add:
+            try:
+                await self.app.client.reactions_add(
+                    channel=channel, timestamp=ts, name=add,
+                )
+            except Exception as e:
+                log.debug("reactions.add %s on %s/%s: %s", add, channel, ts, e)
+
+    async def _mark_lifecycle(
+        self, message: IncomingMessage, remove: Optional[str], add: Optional[str],
+    ) -> None:
+        """Apply a reaction transition to every Slack ts this message represents.
+
+        Coalesced batches carry every original ts in `batched_event_ts`; the
+        lifecycle transition fires on each in parallel so the user sees
+        consistent state across all of their rapid follow-ups.
+
+        Scheduled messages have fabricated ts values that aren't real Slack
+        messages — skip them entirely (reactions_add would 404).
+        """
+        if message.scheduled:
+            return
+        targets = message.batched_event_ts or [message.event_ts]
+        await asyncio.gather(
+            *(self._react_swap(message.channel, ts, remove, add) for ts in targets),
+            return_exceptions=True,
+        )
 
     async def _set_thinking_status(self, channel: str, thread_ts: str) -> None:
         """Set 'is thinking…' status at session start.
@@ -526,9 +577,11 @@ class Daemon:
         self._thread_cache[f"{channel}:{message.thread_ts or ts}"] = (
             True, time.monotonic(),
         )
-        save_cursor(ts)
         # Acknowledge receipt with :eyes: immediately, before the worker even
         # picks the message up. Fire-and-forget — don't slow the queue down.
+        # NOTE: cursor advance has moved to session-completion time (see
+        # _worker), so that a crash mid-session leaves the message recoverable
+        # by boot replay rather than silently advancing past it.
         asyncio.create_task(self._post_eyes_reaction(channel, ts))
         await self.queue.put(message)
         attachment_note = f" with {len(files)} attachment(s)" if files else ""
@@ -650,6 +703,13 @@ class Daemon:
             message = self._coalesce_thread_batch(message)
 
             async with self.session_lock:
+                # Lifecycle: :eyes: (queue-time ack) → :hourglass_flowing_sand:
+                # (Sam is working on it). Fire-and-forget would be wrong here —
+                # we need the user-visible state to update before Sam starts
+                # producing output. Cheap call.
+                await self._mark_lifecycle(
+                    message, remove="eyes", add="hourglass_flowing_sand",
+                )
                 # Set a placeholder status before the session starts so the
                 # user sees "sam is thinking…" in the gap before Sam's own
                 # `setStatus` call kicks in (Slack prepends the bot name to
@@ -665,8 +725,18 @@ class Daemon:
                     first_result = None
 
                 if first_result is None or not first_result.failed:
-                    if first_result is not None:
-                        await self._append_session_badges(message, first_result)
+                    if first_result is None:
+                        # Session crashed before producing a result. Leave
+                        # :hourglass_flowing_sand: in place and don't advance
+                        # the cursor — boot replay can re-pick this message
+                        # up on the next start.
+                        continue
+                    await self._append_session_badges(message, first_result)
+                    await self._mark_lifecycle(
+                        message, remove="hourglass_flowing_sand", add="white_check_mark",
+                    )
+                    if not message.scheduled:
+                        save_cursor(message.event_ts)
                     continue
 
                 log.info(
@@ -704,8 +774,16 @@ class Daemon:
                         retry_result.exit_code if retry_result else "n/a",
                     )
                     await self._post_operator_alert(message, first_result, retry_result)
+                    await self._mark_lifecycle(
+                        message, remove="hourglass_flowing_sand", add="x",
+                    )
                 else:
                     await self._append_session_badges(retry_message, retry_result)
+                    await self._mark_lifecycle(
+                        message, remove="hourglass_flowing_sand", add="white_check_mark",
+                    )
+                if not message.scheduled:
+                    save_cursor(message.event_ts)
 
     async def _post_operator_alert(
         self,

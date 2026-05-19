@@ -61,6 +61,11 @@ class IncomingMessage:
     # Prior messages in the thread, oldest-first, excluding the triggering message.
     # Populated by the daemon for thread-reply events; empty for top-level mentions.
     thread_history: list[dict] = field(default_factory=list)
+    # Every Slack ts this IncomingMessage represents. Single-message events
+    # carry [event_ts]; coalesced batches carry every original. Used by the
+    # daemon's reaction lifecycle so :eyes:/:hourglass:/:white_check_mark:
+    # fire on every batched original, not just the leader.
+    batched_event_ts: list[str] = field(default_factory=list)
 
     def _sender_label(self) -> str:
         """Human-readable sender reference for the initial user message.

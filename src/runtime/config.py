@@ -64,8 +64,10 @@ CURSOR_PATH = SAM_HOME / "cursor.json"
 # Timing and buffer knobs
 # -----------------------------------------------------------------------------
 
-# How long without any stdout/stderr output before we consider Sam stuck
-STUCK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes
+# How long without any stdout/stderr output before we consider Sam stuck.
+# Bumped from 10 to 15 minutes after observing legitimate Opus runs that
+# stayed silent for 12+ minutes during deep multi-tool sequences.
+STUCK_TIMEOUT_SECONDS = 15 * 60  # 15 minutes
 # Hard cap on a single session's wall clock
 MAX_SESSION_SECONDS = 60 * 60     # 1 hour
 # How long to cache "has the bot posted in this thread?" lookups
