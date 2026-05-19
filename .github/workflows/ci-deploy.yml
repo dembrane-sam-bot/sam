@@ -124,6 +124,8 @@ jobs:
             echo "MAX_INSTANCES=$(yq '.cloud_run.max_instances' infra/config.yaml)"
             echo "MEMORY=$(yq '.cloud_run.memory' infra/config.yaml)"
             echo "CPU=$(yq '.cloud_run.cpu' infra/config.yaml)"
+            echo "BOT_NAME=$(yq '.bot_identity.name' infra/config.yaml)"
+            echo "BOT_EMAIL=$(yq '.bot_identity.email' infra/config.yaml)"
             echo "WIF_PROVIDER=$(yq '.gcp_wif_provider' infra/config.generated.yaml)"
             echo "DEPLOY_SA=$(yq '.gcp_deploy_sa' infra/config.generated.yaml)"
             echo "RUNTIME_SA=$(yq '.gcp_runtime_sa' infra/config.generated.yaml)"
@@ -140,6 +142,13 @@ jobs:
           ENV_VARS="${ENV_VARS},SAM_OPERATOR_USER_ID=${SLACK_OPERATOR_USER_ID}"
           ENV_VARS="${ENV_VARS},SAM_HOME=${SAM_HOME}"
           ENV_VARS="${ENV_VARS},TZ=${TIMEZONE}"
+          # Git author/committer for the bot. Git reads these in preference
+          # to gitconfig, so commits inside the container attribute to the bot
+          # without the daemon needing to touch gitconfig user.* entries.
+          ENV_VARS="${ENV_VARS},GIT_AUTHOR_NAME=${BOT_NAME}"
+          ENV_VARS="${ENV_VARS},GIT_AUTHOR_EMAIL=${BOT_EMAIL}"
+          ENV_VARS="${ENV_VARS},GIT_COMMITTER_NAME=${BOT_NAME}"
+          ENV_VARS="${ENV_VARS},GIT_COMMITTER_EMAIL=${BOT_EMAIL}"
           echo "ENV_VARS=${ENV_VARS}" >> "$GITHUB_ENV"
 
       - name: Compose secret-mount string

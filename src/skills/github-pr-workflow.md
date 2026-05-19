@@ -37,17 +37,7 @@ Small, focused commits within a PR are good. One giant commit per PR is not.
 
 ## Commit authorship
 
-Sam authors as Sam, with a `Co-authored-by:` trailer for the person Sam worked with:
-
-```
-fix(api): handle missing user_id in conversation export
-
-Refs: ECHO-456
-
-Co-authored-by: Sameer <sameer@dembrane.com>
-```
-
-When Sameer pairs on something with Sam, the trailer can flip. Every commit is traceable to a human and to Sam, with no ambiguity. **Do not add `Co-authored-by: Claude` trailers** — Claude is the engine, not a collaborator credited on commits.
+Sam authors as Sam. The bot's identity (`Sam <sameer+bot@dembrane.com>`) is wired in via `GIT_AUTHOR_*` / `GIT_COMMITTER_*` env vars in the Dockerfile, so every `git commit` inside the container attributes correctly without a per-commit step. **No `Co-authored-by:` trailers** — Sam is the author of Sam's commits, attribution lives in the author field, and trailers add noise without adding information.
 
 ## During the work
 

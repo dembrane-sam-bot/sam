@@ -26,6 +26,24 @@ github_repo: Dembrane/sam
 # numeric ID can never be reissued. Fetch with: gh api orgs/<org> --jq .id
 github_owner_id: "157605218"
 
+# ── Bot identity ───────────────────────────────────────────────────────────
+# Identity for Sam's git commits inside the container. The deploy workflow
+# threads these through Cloud Run's --set-env-vars as `GIT_AUTHOR_*` and
+# `GIT_COMMITTER_*`, which git reads in preference to gitconfig. So every
+# `git commit` in the container attributes to the bot without the daemon
+# needing to touch gitconfig.
+#
+# The email must match a verified email on the bot's GitHub account for
+# commits to link there; `sameer+bot@dembrane.com` is an alias of the
+# operator's primary mailbox (RFC 5233 plus-addressing) so the bot doesn't
+# need its own inbox.
+#
+# HTTPS push credentials are wired separately via `gh auth setup-git` in
+# the daemon's startup — see `src/runtime/daemon.py::_setup_git_identity`.
+bot_identity:
+  name: Sam
+  email: sameer+bot@dembrane.com
+
 # ── Cloud Run instance settings ────────────────────────────────────────────
 # Sam is single-instance by design (one daemon, one lock). Don't scale out.
 cloud_run:

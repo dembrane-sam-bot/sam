@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -60,6 +61,41 @@ from .config import (
 )
 from .prompts import OPERATOR_ALERT_TEMPLATE, SCHEDULED_SKILL_TEMPLATE
 from .session import IncomingMessage, SamSession, SessionResult
+
+
+# -----------------------------------------------------------------------------
+# Bot identity — git credential helper wiring
+# -----------------------------------------------------------------------------
+
+def _setup_git_identity() -> None:
+    """Wire `gh` as git's credential helper so `git push` works from the container.
+
+    Runs `gh auth setup-git`, which writes a `credential.helper = !gh auth
+    git-credential` entry to gitconfig. After this, `git push https://github.com/...`
+    finds the bot's token via `gh` without the token being embedded in remote
+    URLs (where it would leak in process listings or `git remote -v`).
+
+    Git author identity (user.name / user.email) is set via the
+    `GIT_AUTHOR_*` and `GIT_COMMITTER_*` environment variables in the
+    Dockerfile, so this function deliberately doesn't touch gitconfig
+    `user.*` entries — they'd be redundant and would create a second source
+    of truth.
+
+    No-op when `GITHUB_TOKEN` isn't set (local dev outside the container).
+    Best-effort: failures log and continue. Git operations that need the
+    helper would surface clearer errors if this hadn't worked.
+    """
+    if not os.environ.get("GITHUB_TOKEN"):
+        log.debug("no GITHUB_TOKEN in env; skipping git credential helper setup")
+        return
+    try:
+        subprocess.run(  # noqa: S603  # static args, no shell
+            ["gh", "auth", "setup-git"],  # noqa: S607  # gh is on PATH inside the container image
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        log.info("git credential helper configured via `gh auth setup-git`")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        log.exception("`gh auth setup-git` failed; git push may not work for this run")
 
 
 # -----------------------------------------------------------------------------
@@ -1009,6 +1045,11 @@ async def amain() -> int:
     except LockError as e:
         log.error("%s", e)
         return 1
+
+    # Wire up git's credential helper so the bot's token works for HTTPS push.
+    # Done after acquire_lock (which would catch a second-daemon race) and
+    # before any session can start — git pushes happen inside Sam's sessions.
+    _setup_git_identity()
 
     daemon = Daemon()
 
