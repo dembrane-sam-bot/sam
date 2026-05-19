@@ -253,7 +253,29 @@ class Daemon:
             display_name=first.display_name,
             is_principal_operator=first.is_principal_operator,
             raw_event=first.raw_event,
+            thread_history=first.thread_history,
         )
+
+    async def _fetch_thread_history(
+        self, channel: str, thread_ts: str, exclude_ts: str,
+    ) -> list[dict]:
+        """Return prior messages in a thread, oldest-first, excluding the trigger.
+
+        Used to pre-load context so Sam sees the full thread without having to
+        call conversations_replies manually in every session.
+
+        Fetches up to 100 messages. On any API failure returns [] — thread
+        context is best-effort; it should never block queuing.
+        """
+        try:
+            resp = await self.app.client.conversations_replies(
+                channel=channel, ts=thread_ts, limit=100,
+            )
+        except Exception:
+            log.exception("thread history fetch failed for %s/%s", channel, thread_ts)
+            return []
+        messages = resp.get("messages") or []
+        return [m for m in messages if m.get("ts") != exclude_ts]
 
     async def _bot_participates_in_thread(self, channel: str, thread_ts: str) -> bool:
         """Has the bot ever posted in this thread?
@@ -474,17 +496,28 @@ class Daemon:
 
         display_name, is_principal = await self._resolve_user(user)
 
+        # Fetch prior thread messages so Sam has full context without an extra
+        # API call inside the session. Only fires for thread replies (when
+        # thread_ts is set and differs from the triggering event ts).
+        thread_ts = event.get("thread_ts")
+        thread_history: list[dict] = []
+        if thread_ts:
+            thread_history = await self._fetch_thread_history(
+                channel, thread_ts, exclude_ts=ts,
+            )
+
         files = event.get("files") or []
         message = IncomingMessage(
             channel=channel,
             user=user,
             text=event.get("text", ""),
-            thread_ts=event.get("thread_ts"),
+            thread_ts=thread_ts,
             event_ts=ts,
             files=files,
             display_name=display_name,
             is_principal_operator=is_principal,
             raw_event=event,
+            thread_history=thread_history,
         )
         # Pre-warm the thread-participation cache so subsequent replies in
         # this thread route without a Slack round-trip.

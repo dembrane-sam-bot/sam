@@ -69,6 +69,9 @@ class IncomingMessage:
     retry_context: Optional[dict] = None  # Set on a one-shot retry session after a failed first attempt
     scheduled: bool = False  # True when synthesised by the daemon's scheduler (not a real Slack message)
     raw_event: dict = field(repr=False, default_factory=dict)
+    # Prior messages in the thread, oldest-first, excluding the triggering message.
+    # Populated by the daemon for thread-reply events; empty for top-level mentions.
+    thread_history: list[dict] = field(default_factory=list)
 
     def _sender_label(self) -> str:
         """Human-readable sender reference for the initial user message.
@@ -85,6 +88,38 @@ class IncomingMessage:
         )
         return f"{name_part}(<@{self.user}>, {principal_part})"
 
+    def _format_thread_history(self) -> str:
+        """Render prior thread messages as a readable context block.
+
+        Each message is one line: [ts] sender: text. Bot messages are
+        labelled "Sam (bot)"; human messages use their <@user_id> Slack
+        reference. Messages whose text exceeds 2 000 chars are truncated.
+        Empty (no text) messages are skipped.
+
+        Returns an empty string when there is nothing to show.
+        """
+        if not self.thread_history:
+            return ""
+        lines: list[str] = ["## Prior thread context (oldest first)", ""]
+        for msg in self.thread_history:
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            ts = msg.get("ts") or "?"
+            if msg.get("bot_id"):
+                sender = "Sam (bot)"
+            else:
+                uid = msg.get("user") or "unknown"
+                sender = f"<@{uid}>"
+            if len(text) > 2000:
+                text = text[:2000] + "… [truncated]"
+            lines.append(f"[{ts}] {sender}: {text}")
+        if len(lines) <= 2:
+            # Only the header was added — no real content.
+            return ""
+        lines.append("")
+        return "\n".join(lines)
+
     def to_initial_user_message(self) -> str:
         """Format as the first user message into Sam's session."""
         if self.retry_context:
@@ -93,7 +128,10 @@ class IncomingMessage:
             return self._format_scheduled_message()
 
         thread_part = f"thread_ts={self.thread_ts}" if self.thread_ts else "no thread"
+        history_block = self._format_thread_history()
+        preamble = f"{history_block}\n---\n\n" if history_block else ""
         body = (
+            f"{preamble}"
             f"Slack message in channel {self.channel} from {self._sender_label()} ({thread_part}):\n\n"
             f"{self.text}\n\n"
         )
