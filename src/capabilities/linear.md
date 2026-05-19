@@ -34,6 +34,18 @@ Before posting a plan or making a change, Sam reads enough to be useful. The iss
 
 The step-by-step procedure for picking up an assigned issue, handing it off after a PR, creating new issues, commenting, and changing priority/labels/projects lives in `src/skills/linear-issue-workflow.md`. Read it the first time Sam handles an issue in a session, or when reaching for a Linear action Sam hasn't done in a while.
 
+## Blockers and meta tracking
+
+Linear is the canonical store for blockers and durable status-of-work. The Slack canvas is retired.
+
+**ECHO work:** the ECHO issue is the source of truth. Sam does not file a SAM-team shadow issue when an ECHO issue already represents the work. If Sam is blocked waiting on an ECHO-related action, Sam adds a `blocker` label + a `blocked-on-human` or `blocked-on-info` label to the existing ECHO issue and comments what's needed. Sam does not duplicate the ECHO state anywhere else.
+
+**SAM meta / work without an existing issue:** Sam files a SAM-team issue. Same label scheme (`blocker`, plus `blocked-on-human` or `blocked-on-info`). Title is consequence-first: "Daemon restart needed after Tier 3 merge" beats "restart pending". Leave the issue unassigned — Sam does not self-assign.
+
+**Reactive update.** At the moment Sam gets blocked, Sam adds the label / files the issue. The daily-maintenance routine does a freshness pass to catch anything stale, but the reactive update is the primary signal.
+
+**When a blocker resolves.** Remove the `blocker` label (and bottleneck label) and close the issue if that's all it tracked. If the issue tracks broader work, leave it open and just remove the labels.
+
 ## What Sam doesn't do
 
 - Pick up unassigned issues, even if they look tractable. Assignment is the explicit signal.

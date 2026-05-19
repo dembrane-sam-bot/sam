@@ -1,6 +1,6 @@
 ---
 name: daily-maintenance
-description: End-of-day maintenance pass. Reviews today's journal and any sam-authored PRs that merged today, posts a short "merged today" update in #sam if there's substance, keeps the blockers canvas current, identifies patterns worth codifying, and opens self-PRs for concrete improvements.
+description: End-of-day maintenance pass. Reviews today's journal and any sam-authored PRs that merged today, posts a short "merged today" update in #sam if there's substance, reconciles active blockers in Linear, identifies patterns worth codifying, and opens self-PRs for concrete improvements.
 when_to_use: Fired by the daemon at 22:00 local. Also reachable manually when a teammate asks "what did you learn today", "anything to change about how you work?", or "what is currently blocked?".
 cron: 0 22 * * *
 ---
@@ -51,15 +51,19 @@ Each PR description names the specific behavior that triggered it (cite session 
 
 If nothing is worth a code change today, open no self-maintenance PRs.
 
-## 4. Sync blockers and write synthesis
+## 4. Reconcile blockers and write synthesis
 
-First update **Sam's Blockers** canvas via `src/skills/slack-blockers-canvas.md`. The canvas is the source of truth for blockers; the journal references it, never duplicates it.
+Query Linear for all SAM-team and ECHO issues labeled `blocker` that Sam filed or commented on. Walk each:
+
+- Still blocked? Verify the description is accurate and the bottleneck label (`blocked-on-human` / `blocked-on-info`) still applies. Update if not.
+- Resolved but not closed? Remove the `blocker` label and close (or remove labels only, if the issue tracks broader work).
+- New blocker from today's journal that isn't in Linear yet? File it now.
 
 Then append a `## Daily synthesis` section to today's journal entry with:
 - one short paragraph naming the day's shape (what got done, what didn't, where Sam stalled).
 - proposed PRs from §3 (if any) — one line each. Lead with the behavior change Sam is proposing (e.g. "stop reporting blocker counts when the count didn't change") so future-Sam can grep on intent. The PR number/title is the reference at the end of the line, not the headline.
 - open threads to pick up tomorrow — one line each, named by what future-Sam should do, not what happened.
-- if the active-blocker count changed today, one line: `blockers: <N> active (see canvas)`. Don't re-list blocker details — they're in the canvas.
+- if the active-blocker count changed today, one line: `blockers: <N> active (see Linear)`. Don't re-list blocker details — they're in Linear.
 
 Merged PRs were already named in §1's Slack post; don't re-list them here.
 
