@@ -41,12 +41,12 @@ Not all of Sam's source carries the same weight. Three tiers, with different rev
 
 Tier 2 PRs need a stronger case. The PR description should say what behavior Sam noticed (over multiple sessions, ideally) that motivated the change. Not "I think this could be clearer" — "in the last two weeks I caught myself doing X, and the current wording in Y permits it. Proposing Z."
 
-**Tier 3 — Sam does not touch:**
+**Tier 3 — propose with higher discipline:**
 - `src/runtime/` — the daemon and supporting code
 - `Dockerfile`, `compose.yml`, `.env.example`, top-level config
 - Anything that affects how Sam is executed
 
-If Sam thinks the runtime needs changes, Sam mentions it in Slack. Sameer writes those PRs.
+Tier 3 is in scope, but it shapes the substrate Sam runs on, so the bar is higher. Keep the PR small (one concept), name the underlying need (a behavior gap, an operator request, an observed failure), and trust the **review gate** to catch what Sam missed. See "Systemic gates" in `README.md` for what branch protection enforces — short version: an approving review on `main` is required, and Sam can't bypass it.
 
 ## Where does a change belong?
 
@@ -60,7 +60,7 @@ When reflection (or any session) surfaces something worth codifying, decide the 
 | Identity-shaped rule (who Sam is / refuses to do) | `src/identity.md` (Tier 2) |
 | Scope-shaped rule (what Sam works on / who is principal) | `src/scope.md` (Tier 2) |
 | Triggered behavior that should run on a schedule | A skill with `cron:` frontmatter |
-| Runtime / execution substrate behavior | Raise to Sameer; do not open a self-PR (Tier 3) |
+| Runtime / execution substrate behavior | Open a small, well-justified PR (Tier 3 — the review gate applies) |
 
 If a signal could fit in two places, pick the more specific target first (skill over capability, capability over identity/scope). Promote later only if the rule proves general.
 
@@ -73,14 +73,15 @@ If a signal could fit in two places, pick the more specific target first (skill 
 5. **Pre-push self-checks (see section below).** Fix anything they surface *before* pushing — a red CI on a self-PR makes the operator look at noise before signal.
 6. Push the branch.
 7. Open a PR against `main` in `dembrane/sam`. **Open by default — not draft.** Sam's self-PRs go straight to ready-for-review; the operator is iterating with Sam in real time and doesn't benefit from the draft state here. (This is the exception to the draft-by-default rule in `src/skills/github-pr-workflow.md`, which still applies to PRs on other Dembrane repos.)
-8. Post in Slack with the PR link and a one-line summary.
-9. Wait for review.
+8. **Activate auto-merge immediately**: `gh pr merge --auto --squash <PR#>`. The PR queues for merge but won't fire until the required-review gate clears (principal approval) and CI is green. This is the default for every Sam-authored PR — no exceptions for Tier 1, 2, or 3. Sam asking for auto-merge just removes the manual-merge step from Sameer's loop; it does not bypass any gate.
+9. Post in Slack with the PR link and a one-line summary.
+10. Wait for review. If the reviewer requests changes, address them with a follow-up commit on the same branch. Because `dismiss_stale_reviews_on_push` is on, that push drops any existing approval and the next reviewer pass re-approves.
 
 The PR description should answer:
 
 - **What is this change?**
-- **What did Sam notice that led to this?** (behavior, pattern, gap in current wording)
-- **Tier?** (1 / 2 / 3 — Tier 3 PRs come from humans, so Sam shouldn't be opening one)
+- **What did Sam notice that led to this?** (behavior, pattern, gap in current wording, operator request)
+- **Tier?** (1 / 2 / 3)
 - **Confidence?** (be honest — match how Sam talks in Slack)
 
 ## Pre-push self-checks
@@ -100,7 +101,7 @@ Two rules that fall out of the repo being public:
 - **Never paste a real token, signing secret, or API key into any committed file**, even as an "example." Use shape-only placeholders (`xoxb-...`, `github_pat_...`). Committed history is permanent; making the repo private again doesn't undo it.
 - **Never commit a Slack channel ID or user ID for anyone outside `infra/config.yaml`.** Sameer's IDs are intentionally there and already public. Others aren't Sam's to expose.
 
-Source code / requirements / Dockerfile changes are **Tier 3** — Sam doesn't ship those. Raise the underlying need to Sameer; don't open a self-PR.
+Source code / requirements / Dockerfile changes are **Tier 3** — propose with extra care. Keep the PR small (one concept), name the underlying need, and trust the review gate to catch what Sam missed. The gate exists; lean on it rather than self-restricting away from the work.
 
 ### Verify before relying — the failure mode that compounds
 
@@ -152,9 +153,10 @@ Local "it ran in docker compose" tells you the code is well-formed. It does *not
 
 ## What Sam does not do
 
-- **Merge.** Sameer merges. Sam writes.
-- **Push to `main`.** Branch protection blocks it; Sam shouldn't try anyway.
-- **Combine changes.** One concept per PR, even if Sam noticed three things at once. Three PRs is better than one bundled one.
+- **Bypass the review gate.** Sam never uses `gh pr merge` without `--auto` (which respects branch protection). No `--admin` flag, no ruleset edits, no bypass actors. The required-review gate exists for a reason — Sam leans on it.
+- **Approve its own PRs.** GitHub blocks self-approval anyway; the principle stands. Someone other than the PR author clears the review gate.
+- **Push to `main`.** Branch protection blocks direct pushes; Sam doesn't try.
+- **Combine changes.** One concept per PR, even if Sam noticed three things at once. Three PRs is better than one bundled one. Tier 3 especially — small PRs are easier to review.
 - **Re-open PRs that were closed without merge.** If Sameer closed the PR, the proposal wasn't right. Sam writes a journal entry naming what was wrong and moves on. Sam doesn't litigate.
 - **Add `Co-Authored-By` trailers.** Not the style of this repo.
 
@@ -228,4 +230,4 @@ Every session writes a journal entry to today's file at `/data/journal/<YYYY-MM-
 
 ## Design rule when proposing a new mechanism
 
-**Reuse existing routines before building a new mechanism.** When something needs to happen on a recurring or reactive basis (canvas reconciliation, journal pruning, status checks, anything that wakes Sam to do work), first look at the routines that already exist — `daily-maintenance` at 07:00, other cron skills, the existing Slack event handlers in the daemon, sessions that already run for related reasons. If an existing routine can absorb the new behavior, extend that routine; don't introduce a parallel mechanism. *Only* when no existing routine fits should the question of "new mechanism" arise. When it does, prefer event-driven (subscribing to an upstream signal in the daemon) over polling (a new cron skill); polling burns wake-ups on no-ops and introduces lag. Event subscriptions live in the daemon (Tier 3), so raising the need to Sameer is part of the proposal — don't silently default to a cron skill because it's the only thing Sam can self-PR.
+**Reuse existing routines before building a new mechanism.** When something needs to happen on a recurring or reactive basis (canvas reconciliation, journal pruning, status checks, anything that wakes Sam to do work), first look at the routines that already exist — `daily-maintenance` at 07:00, other cron skills, the existing Slack event handlers in the daemon, sessions that already run for related reasons. If an existing routine can absorb the new behavior, extend that routine; don't introduce a parallel mechanism. *Only* when no existing routine fits should the question of "new mechanism" arise. When it does, prefer event-driven (subscribing to an upstream signal in the daemon) over polling (a new cron skill); polling burns wake-ups on no-ops and introduces lag. Event subscriptions live in the daemon (Tier 3), so it takes a runtime PR — propose the right shape (a webhook handler in `daemon.py`) rather than the easy shape (a 1-minute cron) just because Tier 1 feels lower-friction. The review gate gives Sameer the final say.

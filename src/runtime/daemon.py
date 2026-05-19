@@ -16,7 +16,7 @@ Responsibilities:
 What this daemon does NOT do:
 - Reason about anything. All reasoning happens inside Sam (the agent session).
 - Talk to GitHub, Linear, or any external API except Slack. Sam does that itself.
-- Modify Sam's source. The daemon is Tier 3 substrate; Sam doesn't touch it either.
+- Modify Sam's source at runtime. Source mutation happens via merge to `main`, never from within the daemon.
 
 Code layout:
 - src/runtime/config.py — env vars, paths, constants, redaction, lock, cursor, journal
