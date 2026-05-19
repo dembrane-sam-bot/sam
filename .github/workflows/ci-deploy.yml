@@ -177,6 +177,11 @@ jobs:
         # --execution-environment=gen2 is required for cloud-storage volume mounts.
         # --add-volume + --add-volume-mount mount the GCS data bucket at /data so
         # Sam's journal survives restarts/redeploys.
+        #
+        # --liveness-probe: Cloud Run polls /healthz every 60s. If 10 consecutive
+        # checks fail (~10 min), the container is killed and a fresh one starts.
+        # Without this, a hung asyncio loop stays "Ready" forever — that exact
+        # failure mode bit us once already.
         run: |
           gcloud run deploy sam \
             --image="${ARTIFACT_REGISTRY}/sam:${GITHUB_SHA}" \
@@ -191,4 +196,5 @@ jobs:
             --set-env-vars="${ENV_VARS}" \
             --set-secrets="${SECRETS}" \
             --add-volume="name=sam-data,type=cloud-storage,bucket=${DATA_BUCKET}" \
-            --add-volume-mount="volume=sam-data,mount-path=${SAM_HOME}"
+            --add-volume-mount="volume=sam-data,mount-path=${SAM_HOME}" \
+            --liveness-probe="httpGet.path=/healthz,httpGet.port=8080,periodSeconds=60,failureThreshold=10,timeoutSeconds=5"
