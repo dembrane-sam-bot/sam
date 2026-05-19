@@ -1,28 +1,29 @@
 """ADK agent runner for Sam.
 
 Implements the AgentRunner Protocol using Google's Agent Development Kit
-(ADK) with a hybrid model setup on Vertex AI's EU multi-region endpoint:
-  - Main loop: Gemini 3.1 Flash-Lite via ADK's native Gemini client.
-  - Arc subagent: Anthropic Claude Opus 4.7 via ADK's Claude class, with a
-    subclass that injects the correct multi-region base_url for AnthropicVertex.
+(ADK) with an INVERTED hybrid model setup on Vertex AI EU multi-region:
+  - Main loop: Claude Opus 4.7 via ADK's Claude class (subclass injects the
+    multi-region base_url AnthropicVertex doesn't infer).
+  - Worker fleet: Gemini 3.1 Flash-Lite via ADK's native Gemini client,
+    accessed via `worker` (single dispatch) and `parallel_workers`
+    (fan-out). Workers do narrow, focused tasks — file reads, greps,
+    edits, shell, parallel lookups — that don't need Opus-level reasoning.
 
 Architecture:
-  main agent — SAM_SMALL_MODEL (Gemini 3.1 Flash-Lite, native ADK)
-    ├── bash                    run shell commands
-    ├── read_file               read files from disk
-    ├── write_file              write files to disk
-    ├── edit_file               exact-string replacement in files
-    ├── grep                    search file contents
-    ├── glob_files              find files by pattern
-    ├── fetch_url               fetch a URL and return content
-    ├── arc                     AgentTool → arc agent (SAM_BIG_MODEL = Claude Opus 4.7, single task)
-    │                               ├── read_file
-    │                               ├── grep
-    │                               ├── glob_files
-    │                               └── fetch_url
-    └── parallel_arc_research   fan-out: N arc agents run via asyncio.gather
-                                    each branch gets its own LlmAgent + InMemorySession
-                                    results returned labeled and concatenated
+  main agent — SAM_MAIN_MODEL (Claude Opus 4.7, deep reasoning + Slack reply)
+    ├── bash                  run shell commands
+    ├── read_file             read files from disk
+    ├── write_file            write files to disk
+    ├── edit_file             exact-string replacement in files
+    ├── grep                  search file contents
+    ├── glob_files            find files by pattern
+    ├── fetch_url             fetch a URL and return content
+    ├── worker                AgentTool → one worker (SAM_WORKER_MODEL, full tools sans recursion)
+    │                             ├── bash, read_file, write_file, edit_file
+    │                             └── grep, glob_files, fetch_url
+    └── parallel_workers      fan-out: N workers via asyncio.gather
+                                  each branch gets its own LlmAgent + InMemorySession
+                                  results returned labeled and concatenated
 
 Vertex AI auth: set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, and either
 GOOGLE_APPLICATION_CREDENTIALS or ADC (gcloud auth application-default login)
@@ -46,8 +47,8 @@ from typing import Optional
 
 from .config import (
     MAX_SESSION_SECONDS,
-    SAM_BIG_MODEL,
-    SAM_SMALL_MODEL,
+    SAM_WORKER_MODEL,
+    SAM_MAIN_MODEL,
     SAM_SRC,
     STUCK_TIMEOUT_SECONDS,
     log,
@@ -226,25 +227,26 @@ async def fetch_url(url: str) -> str:
         return f"error fetching {url}: {exc}"
 
 
-# ─── Arc agent instruction ─────────────────────────────────────────────────────
+# ─── Worker agent instruction ──────────────────────────────────────────────────
 
 
-def _load_arc_instruction() -> str:
-    """Read the arc agent instruction from src/runtime/agents/arc.md.
+def _load_worker_instruction() -> str:
+    """Read the worker agent instruction from src/runtime/agents/worker.md.
 
     Returns the body (everything after the YAML frontmatter). Falls back to
     a minimal inline instruction if the file is missing — so a first-run
     before the file exists doesn't hard-fail.
     """
-    arc_path = SAM_SRC / "runtime" / "agents" / "arc.md"
-    if not arc_path.exists():
-        log.warning("arc.md not found at %s; using fallback instruction", arc_path)
+    worker_path = SAM_SRC / "runtime" / "agents" / "worker.md"
+    if not worker_path.exists():
+        log.warning("worker.md not found at %s; using fallback instruction", worker_path)
         return (
-            "You are arc, a deep-reasoning partner for Sam. "
-            "Analyse carefully, cite file:line, be honest about uncertainty. "
-            "Return findings — do not edit files or call external APIs."
+            "You are a focused worker for Sam. Do the task and report what "
+            "happened. You have read/write/grep/fetch/bash tools. Cite "
+            "file:line. Be honest about uncertainty. Don't post to Slack — "
+            "Sam handles user-facing communication."
         )
-    text = arc_path.read_text()
+    text = worker_path.read_text()
     # Strip YAML frontmatter if present
     if text.startswith("---\n"):
         end = text.find("\n---\n", 4)
@@ -325,27 +327,31 @@ def _generate_adk_model(model_id: str):
     return _ClaudeMultiRegion(model=model_id)
 
 
-# ─── Parallel arc fan-out ─────────────────────────────────────────────────────
+# ─── Parallel worker fan-out ──────────────────────────────────────────────────
 
 
-def _make_parallel_arc_tool(arc_instruction: str):
-    """Return a coroutine that fans out N arc tasks in parallel via asyncio.gather.
+def _make_parallel_workers_tool(worker_instruction: str, bash_tool):
+    """Return a coroutine that fans out N worker tasks in parallel via asyncio.gather.
 
-    Each task gets a fresh LlmAgent(arc) + InMemorySessionService so there is
-    no shared state between branches. Results are returned in order, labeled by
-    task number, and concatenated with a separator.
+    Each task gets a fresh LlmAgent(worker) + InMemorySessionService so there
+    is no shared state between branches. Results are returned in order,
+    labeled by task number, and concatenated with a separator.
 
-    Use this when you have 2+ independent research or analysis questions —
-    e.g. "read file A" and "search for pattern B simultaneously". Do not use for
-    sequential tasks where one result feeds the next (call arc twice instead).
+    Use this when you have 2+ independent narrow tasks — e.g. "read file A"
+    and "search for pattern B simultaneously". Do not use for sequential
+    tasks where one result feeds the next (call worker twice instead).
+
+    Workers have write access (write_file, edit_file, bash) — only the
+    recursive tools (worker, parallel_workers) are withheld to prevent
+    exponential fan-out.
     """
 
-    async def parallel_arc_research(tasks: list[str]) -> str:
-        """Run each task in parallel against a fresh arc (big model) agent.
+    async def parallel_workers(tasks: list[str]) -> str:
+        """Run each task in parallel against a fresh worker (small model) agent.
 
         tasks: list of self-contained task descriptions. Each is dispatched to
-        its own arc instance simultaneously. Returns all results labeled and
-        concatenated.
+        its own worker instance simultaneously. Returns all results labeled
+        and concatenated.
         """
         try:
             from google.adk.agents import LlmAgent
@@ -360,20 +366,23 @@ def _make_parallel_arc_tool(arc_instruction: str):
             return "error: no tasks provided"
 
         async def run_one(task: str, idx: int) -> str:
-            arc = LlmAgent(
-                name=f"arc_{idx}",
-                model=_generate_adk_model(SAM_BIG_MODEL),
-                instruction=arc_instruction,
+            worker = LlmAgent(
+                name=f"worker_{idx}",
+                model=_generate_adk_model(SAM_WORKER_MODEL),
+                instruction=worker_instruction,
                 tools=[
+                    FunctionTool(func=bash_tool),
                     FunctionTool(func=read_file),
+                    FunctionTool(func=write_file),
+                    FunctionTool(func=edit_file),
                     FunctionTool(func=grep),
                     FunctionTool(func=glob_files),
                     FunctionTool(func=fetch_url),
                 ],
             )
             svc = InMemorySessionService()
-            arc_runner = Runner(
-                agent=arc, app_name="sam_fanout", session_service=svc
+            worker_runner = Runner(
+                agent=worker, app_name="sam_fanout", session_service=svc
             )
             session = await svc.create_session(
                 app_name="sam_fanout", user_id="sam"
@@ -384,7 +393,7 @@ def _make_parallel_arc_tool(arc_instruction: str):
             )
             result_parts: list[str] = []
             try:
-                async for event in arc_runner.run_async(
+                async for event in worker_runner.run_async(
                     user_id="sam",
                     session_id=session.id,
                     new_message=user_content,
@@ -396,27 +405,29 @@ def _make_parallel_arc_tool(arc_instruction: str):
                             if text:
                                 result_parts.append(text)
             except Exception as exc:
-                return f"(arc_{idx} error: {exc})"
+                return f"(worker_{idx} error: {exc})"
             return "".join(result_parts) or "(no output)"
 
         results = await asyncio.gather(*[run_one(t, i + 1) for i, t in enumerate(tasks)])
         sections = [
-            f"**arc task {i + 1}:** {task}\n\n{result}"
+            f"**worker task {i + 1}:** {task}\n\n{result}"
             for i, (task, result) in enumerate(zip(tasks, results))
         ]
         return "\n\n---\n\n".join(sections)
 
-    return parallel_arc_research
+    return parallel_workers
 
 
 # ─── ADK runner ───────────────────────────────────────────────────────────────
 
 
 class ADKAgentRunner:
-    """Runs a Sam session using Google ADK + Vertex AI Gemini.
+    """Runs a Sam session using Google ADK on Vertex AI.
 
-    Builds a two-tier agent tree on each call to run():
-      main (flash) calls tools and delegates to arc (pro) via AgentTool.
+    Inverted architecture: main is Claude Opus 4.7 (deep reasoning, Slack
+    composition); workers are Gemini 3.1 Flash-Lite (fast, focused tasks)
+    accessible via the `worker` (single) and `parallel_workers` (fan-out)
+    tools.
 
     Vertex AI auth must be present in the environment before the runner is
     used — specifically GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, and
@@ -449,39 +460,43 @@ class ADKAgentRunner:
         # Bash closes over the session's cwd + env.
         bash_tool = _make_bash(cwd=request.cwd, env=request.env)
 
-        # Read-only tools shared by both agents.
-        ro_tools = [
+        # Tools shared between main and workers. Workers get the same tools
+        # except for the recursive `worker` / `parallel_workers` (which would
+        # create exponential fan-out).
+        worker_tools = [
+            FunctionTool(func=bash_tool),
             FunctionTool(func=read_file),
+            FunctionTool(func=write_file),
+            FunctionTool(func=edit_file),
             FunctionTool(func=grep),
             FunctionTool(func=glob_files),
             FunctionTool(func=fetch_url),
         ]
 
-        arc_instruction = _load_arc_instruction()
+        worker_instruction = _load_worker_instruction()
 
-        # Arc — the big model, read-only.
-        arc_agent = LlmAgent(
-            name="arc",
-            model=_generate_adk_model(SAM_BIG_MODEL),
-            instruction=arc_instruction,
-            tools=ro_tools,
+        # `worker` — single dispatch to one Flash-Lite worker.
+        worker_agent = LlmAgent(
+            name="worker",
+            model=_generate_adk_model(SAM_WORKER_MODEL),
+            instruction=worker_instruction,
+            tools=worker_tools,
         )
 
-        # parallel_arc_research — fan-out to N fresh arc agents concurrently.
-        parallel_arc = _make_parallel_arc_tool(arc_instruction)
+        # `parallel_workers` — fan-out to N fresh workers concurrently.
+        parallel_workers = _make_parallel_workers_tool(
+            worker_instruction, bash_tool
+        )
 
-        # Main — small model, full tools including single-arc and fan-out.
+        # Main — Opus 4.7, full tools including worker dispatch.
         main_agent = LlmAgent(
             name="sam",
-            model=_generate_adk_model(SAM_SMALL_MODEL),
+            model=_generate_adk_model(SAM_MAIN_MODEL),
             instruction=request.system_prompt,
             tools=[
-                FunctionTool(func=bash_tool),
-                *ro_tools,
-                FunctionTool(func=write_file),
-                FunctionTool(func=edit_file),
-                AgentTool(agent=arc_agent),
-                FunctionTool(func=parallel_arc),
+                *worker_tools,
+                AgentTool(agent=worker_agent),
+                FunctionTool(func=parallel_workers),
             ],
         )
 

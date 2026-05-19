@@ -43,7 +43,7 @@ from .config import (
     LockError,
     NOISY_MESSAGE_SUBTYPES,
     SAM_CHANNEL,
-    SAM_SMALL_MODEL,
+    SAM_MAIN_MODEL,
     SAM_OPERATOR_USER_ID,
     SLACK_APP_TOKEN,
     SLACK_BOT_TOKEN,
@@ -72,7 +72,7 @@ def _format_session_badges(result: SessionResult) -> str:
     so the footer reads consistently regardless of which combination fires.
     """
     parts: list[str] = []
-    if result.arc_used:
+    if result.worker_used:
         parts.append(":brain:")
     if result.web_used:
         parts.append(":globe_with_meridians:")
@@ -864,7 +864,7 @@ class Daemon:
 
         log.info(
             "Sam daemon ready (channel=%s, commit=%s, model=%s)",
-            SAM_CHANNEL or "all", COMMIT_SHA or "unknown", SAM_SMALL_MODEL,
+            SAM_CHANNEL or "all", COMMIT_SHA or "unknown", SAM_MAIN_MODEL,
         )
 
         await self.shutdown_event.wait()

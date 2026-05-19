@@ -36,18 +36,21 @@ SAM_SRC = SAM_REPO / "src"            # identity, scope, capabilities, skills, r
 SAM_CLAUDE_DIR = SAM_REPO / ".claude" # where Claude Code looks for project-level config
 
 # Model selection — version-controlled config, not .env.
-# Small model: main session. Big model: arc subagent for deep reasoning.
-# Change these by opening a PR to src/runtime/config.py, not via env vars.
+# Sam runs an INVERTED architecture: the expensive reasoning model is in the
+# main loop (where multi-hop planning happens) and a fleet of cheap fast
+# workers handles parallel grunt work. The conventional small-main/big-subagent
+# layout broke Sam's main loop on multi-step Slack tasks (Flash-Lite set
+# status indicators then stalled). Don't flip back without re-validating.
 #
-# Hybrid setup, both addressable via the EU multi-region endpoint
+# Both addressable via the EU multi-region endpoint
 # (GOOGLE_CLOUD_LOCATION=eu) — keeps processing within EU jurisdiction:
 # - Gemini IDs → ADK's native Gemini client; multi-region routing automatic.
 # - claude-* → ADK's Claude class with a subclass that overrides AnthropicVertex
 #   base_url to aiplatform.{eu|us}.rep.googleapis.com/v1 (default region-prefix
 #   hostname doesn't exist for multi-region). See _generate_adk_model in
 #   adk_runner.py.
-SAM_SMALL_MODEL = "gemini-3.1-flash-lite"        # main loop, native ADK Gemini
-SAM_BIG_MODEL = "claude-opus-4-7"                # arc subagent, ADK Claude on Vertex EU multi-region
+SAM_MAIN_MODEL = "claude-opus-4-7"          # main loop, ADK Claude on Vertex EU multi-region
+SAM_WORKER_MODEL = "gemini-3.1-flash-lite"  # worker + parallel_workers fleet, native ADK Gemini
 
 JOURNAL_DIR = SAM_HOME / "journal"
 # Pre-directory combined journal lives alongside the new directory and stays
@@ -232,8 +235,8 @@ def provision_subagents() -> None:
     """No-op with ADK runner.
 
     Previously copied agent .md files into .claude/agents/ for Claude Code
-    auto-discovery. ADK loads the arc agent directly from
-    src/runtime/agents/arc.md at runner startup — no filesystem mirroring
+    auto-discovery. ADK loads the worker agent directly from
+    src/runtime/agents/worker.md at runner startup — no filesystem mirroring
     needed. The function is kept so daemon.py call-sites don't need to change.
     """
     log.debug("provision_subagents: no-op (ADK runner reads agents directly)")

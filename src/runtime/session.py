@@ -291,7 +291,7 @@ class SessionResult:
 
     Reaction flags are independent — any combination can fire on a given
     session:
-    - arc_used      → :brain:
+    - worker_used   → :brain:
     - web_used      → :globe_with_meridians:
     - bash_used     → :computer:
     - edited_files  → :gear:
@@ -304,7 +304,7 @@ class SessionResult:
     last_output_at: float
     stuck: bool
     timed_out: bool
-    arc_used: bool = False        # arc subagent (big model) was dispatched
+    worker_used: bool = False        # worker subagent (small model) was dispatched
     web_used: bool = False        # fetch_url or web search was used
     bash_used: bool = False       # bash used for non-Slack-housekeeping work (git, gh, curl, etc.)
     edited_files: bool = False    # write_file/edit_file touched a path outside /data/journal/
@@ -326,7 +326,7 @@ class SamSession:
 
     DEFAULT_ALLOWED_TOOLS: list[str] = [
         "bash", "read_file", "write_file", "edit_file", "grep", "glob_files",
-        "fetch_url", "arc",
+        "fetch_url", "worker", "parallel_workers",
     ]
 
     def __init__(
@@ -363,7 +363,7 @@ class SamSession:
             agent_result.stuck, agent_result.timed_out,
         )
 
-        arc_used, web_used, bash_used, edited_files = self._classify_tool_use(
+        worker_used, web_used, bash_used, edited_files = self._classify_tool_use(
             agent_result.tool_use_records,
         )
 
@@ -376,7 +376,7 @@ class SamSession:
             last_output_at=agent_result.last_output_at,
             stuck=agent_result.stuck,
             timed_out=agent_result.timed_out,
-            arc_used=arc_used,
+            worker_used=worker_used,
             web_used=web_used,
             bash_used=bash_used,
             edited_files=edited_files,
@@ -395,12 +395,12 @@ class SamSession:
     def _classify_tool_use(
         records: list[ToolUseRecord],
     ) -> tuple[bool, bool, bool, bool]:
-        """Return (arc_used, web_used, bash_used, edited_files) for the
+        """Return (worker_used, web_used, bash_used, edited_files) for the
         post-session badges.
 
         ADK tool names (function names from adk_runner.py):
-        - arc_used     = "arc" (single dispatch) or "parallel_arc_research"
-                         (fan-out) was called — either counts as big-model use.
+        - worker_used  = "worker" (single dispatch) or "parallel_workers"
+                         (fan-out) was called — either counts as delegated work.
         - web_used     = fetch_url was called.
         - bash_used    = bash was called for non-Slack-housekeeping work (bash
           calls whose command contains "slack.com" are post/react/reply
@@ -413,15 +413,15 @@ class SamSession:
         and don't drive any badge. Each flag drives one independent emoji on
         Sam's response; any combination can fire on a given session.
         """
-        arc_used = False
+        worker_used = False
         web_used = False
         bash_used = False
         edited_files = False
         for record in records:
             name = record.name
             input_dict = record.input or {}
-            if name in ("arc", "parallel_arc_research"):
-                arc_used = True
+            if name in ("worker", "parallel_workers"):
+                worker_used = True
             elif name == "fetch_url":
                 web_used = True
             elif name == "bash":
@@ -433,7 +433,7 @@ class SamSession:
                 if not file_path.startswith("/data/journal/"):
                     edited_files = True
             # read_file, grep, glob_files: read-only, no badge.
-        return arc_used, web_used, bash_used, edited_files
+        return worker_used, web_used, bash_used, edited_files
 
     def _safety_net_journal_entry(self, result: SessionResult) -> None:
         """Append a minimal journal entry when something went wrong.
