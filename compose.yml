@@ -7,8 +7,9 @@ services:
     volumes:
       # Sam's persistent state
       - ./data:/data
-      # Sam logs in to Claude Code inside the container.
-      # Bind-mounted to ./.claude so you can inspect the contents from the host.
-      - ./.claude:/home/sam/.claude
+      # Vertex AI ADC (Application Default Credentials).
+      # Created on the host by `gcloud auth application-default login`.
+      # Read-only mount — Sam never writes auth back.
+      - ~/.config/gcloud:/home/sam/.config/gcloud:ro
     environment:
       - TZ=${TZ}
