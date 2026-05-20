@@ -36,21 +36,39 @@ SAM_SRC = SAM_REPO / "src"            # identity, scope, capabilities, skills, r
 SAM_CLAUDE_DIR = SAM_REPO / ".claude" # where Claude Code looks for project-level config
 
 # Model selection — version-controlled config, not .env.
-# Sam runs an INVERTED architecture: the expensive reasoning model is in the
-# main loop (where multi-hop planning happens) and a fleet of cheap fast
+# Sam runs an INVERTED architecture: the most capable reasoning model is in
+# the main loop (where multi-hop planning happens) and a fleet of cheap fast
 # workers handles parallel grunt work. The conventional small-main/big-subagent
 # layout broke Sam's main loop on multi-step Slack tasks (Flash-Lite set
-# status indicators then stalled). Don't flip back without re-validating.
+# status indicators then stalled). Don't flip the inversion without re-validating.
 #
-# Both addressable via the EU multi-region endpoint
-# (GOOGLE_CLOUD_LOCATION=eu) — keeps processing within EU jurisdiction:
-# - Gemini IDs → ADK's native Gemini client; multi-region routing automatic.
-# - claude-* → ADK's Claude class with a subclass that overrides AnthropicVertex
-#   base_url to aiplatform.{eu|us}.rep.googleapis.com/v1 (default region-prefix
-#   hostname doesn't exist for multi-region). See _generate_adk_model in
-#   adk_runner.py.
-SAM_MAIN_MODEL = "claude-opus-4-7"          # main loop, ADK Claude on Vertex EU multi-region
-SAM_WORKER_MODEL = "gemini-3.1-flash-lite"  # worker + parallel_workers fleet, native ADK Gemini
+# Was claude-opus-4-7 as main; switched to Gemini 3.1 Pro Preview because the
+# operator is on Gemini credits. Claude routing is kept in _generate_adk_model
+# so we can A/B back later without re-deriving the multi-region base_url hack.
+#
+# Vertex routing notes:
+# - Per-agent Vertex location: main and worker pin different endpoints because
+#   Gemini 3.x preview is only on "global" and 3.5 Flash works on "eu". ADK's
+#   stock Gemini class reads GOOGLE_CLOUD_LOCATION from env (process-global),
+#   which collapses both agents onto the same endpoint — so adk_runner.py
+#   subclasses Gemini and pins location per agent. See _make_gemini_at_location
+#   in adk_runner.py. Upstream feature request:
+#   https://github.com/google/adk-python/issues/5027
+# - GOOGLE_CLOUD_LOCATION env var is now only a fallback for the dormant
+#   Claude path (kept set to "eu" in .env / infra/config.yaml). Gemini agents
+#   ignore it.
+# - claude-* (dormant) → ADK's Claude class with a subclass that overrides
+#   AnthropicVertex base_url to aiplatform.{eu|us}.rep.googleapis.com/v1.
+#   Anthropic serves Claude only via regional endpoints (not "global"); if
+#   SAM_MAIN_MODEL is flipped back to claude-*, GOOGLE_CLOUD_LOCATION must be
+#   "eu" or "us". See _generate_adk_model in adk_runner.py.
+SAM_MAIN_MODEL = "gemini-3.1-pro-preview"   # main loop reasoning model
+SAM_WORKER_MODEL = "gemini-3.5-flash"       # worker + parallel_workers fleet
+
+# Per-agent Vertex endpoint pinning. Each agent gets its own genai.Client with
+# `location` set explicitly, bypassing the process-global env var.
+SAM_MAIN_VERTEX_LOCATION = "global"   # Gemini 3.x preview only on global endpoint
+SAM_WORKER_VERTEX_LOCATION = "eu"     # 3.5 Flash works on EU (verified 2026-05-20); keeps worker traffic in EU
 
 JOURNAL_DIR = SAM_HOME / "journal"
 # Pre-directory combined journal lives alongside the new directory and stays

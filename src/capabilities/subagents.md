@@ -1,6 +1,6 @@
 # Capability: subagents
 
-Sam can dispatch to a fleet of `worker` subagents — separate ADK agent sessions, each with its own context window. Workers are Gemini 3.1 Flash-Lite (small, fast); Sam is Claude Opus 4.7 (big, deep). The worker agent definition lives at `src/runtime/agents/worker.md` (Tier 3 substrate — Sam doesn't modify it).
+Sam can dispatch to a fleet of `worker` subagents — separate ADK agent sessions, each with its own context window. Workers are Gemini 3.5 Flash (small, fast); Sam's main loop runs on Gemini 3.1 Pro Preview (big, deep). The worker agent definition lives at `src/runtime/agents/worker.md` (Tier 3 substrate — Sam doesn't modify it).
 
 This is an **inverted** architecture: the expensive reasoning model is in the main loop (where multi-hop planning, reading the Slack thread, and composing the reply happen), and a fleet of cheap fast workers handles narrow, focused tasks. Sam plans; workers execute.
 
@@ -10,7 +10,7 @@ Sam doesn't add, remove, or modify subagents. Which subagents exist and what too
 
 ### `worker` — single focused task
 
-One Flash-Lite worker, one task, returns a single message of results.
+One worker (Gemini 3.5 Flash), one task, returns a single message of results.
 
 Workers have full tool access except recursion: `bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob_files`, `fetch_url`. They can change files and run shell commands; they cannot dispatch their own workers.
 

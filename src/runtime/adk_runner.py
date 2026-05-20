@@ -1,16 +1,25 @@
 """ADK agent runner for Sam.
 
 Implements the AgentRunner Protocol using Google's Agent Development Kit
-(ADK) with an INVERTED hybrid model setup on Vertex AI EU multi-region:
-  - Main loop: Claude Opus 4.7 via ADK's Claude class (subclass injects the
-    multi-region base_url AnthropicVertex doesn't infer).
-  - Worker fleet: Gemini 3.1 Flash-Lite via ADK's native Gemini client,
-    accessed via `worker` (single dispatch) and `parallel_workers`
-    (fan-out). Workers do narrow, focused tasks — file reads, greps,
-    edits, shell, parallel lookups — that don't need Opus-level reasoning.
+(ADK) with an INVERTED hybrid model setup. Per-agent Vertex location
+pinning lets main and worker route to different endpoints in the same
+process (see `_make_gemini_at_location` below):
+  - Main loop: Gemini 3.1 Pro Preview on Vertex `global` endpoint
+    (Gemini 3.x preview is global-only).
+  - Worker fleet: Gemini 3.5 Flash on Vertex `eu` endpoint (data
+    residency for the higher-volume worker traffic). Accessed via
+    `worker` (single dispatch) and `parallel_workers` (fan-out).
+    Workers do narrow, focused tasks — file reads, greps, edits, shell,
+    parallel lookups — that don't need main-loop reasoning.
+
+The Claude routing path in `_generate_adk_model` (subclass injecting the
+multi-region base_url AnthropicVertex doesn't infer) is dormant but kept so
+SAM_MAIN_MODEL can be flipped back to claude-* without rederiving the hack.
+Claude reads `GOOGLE_CLOUD_LOCATION` from env (.env / infra/config.yaml keeps
+it set to "eu" for this reason).
 
 Architecture:
-  main agent — SAM_MAIN_MODEL (Claude Opus 4.7, deep reasoning + Slack reply)
+  main agent — SAM_MAIN_MODEL (Gemini 3.1 Pro Preview, deep reasoning + Slack reply)
     ├── bash                  run shell commands
     ├── read_file             read files from disk
     ├── write_file            write files to disk
@@ -25,11 +34,10 @@ Architecture:
                                   each branch gets its own LlmAgent + InMemorySession
                                   results returned labeled and concatenated
 
-Vertex AI auth: set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, and either
-GOOGLE_APPLICATION_CREDENTIALS or ADC (gcloud auth application-default login)
-in the environment. ADK's Gemini client picks up location for multi-region
-routing automatically; LiteLLM gets project/location/api_base via explicit
-kwargs we pass in `_generate_adk_model`.
+Vertex AI auth: set GOOGLE_CLOUD_PROJECT and either GOOGLE_APPLICATION_CREDENTIALS
+or ADC (gcloud auth application-default login) in the environment. Each Gemini
+agent pins its own location via the subclass in `_make_gemini_at_location`;
+the Claude (dormant) path additionally needs GOOGLE_CLOUD_LOCATION set.
 
 Session flow: one Runner per call to run(). Sessions are ephemeral
 (InMemorySessionService). Stuck/timeout detection mirrors
@@ -47,9 +55,11 @@ from typing import Optional
 
 from .config import (
     MAX_SESSION_SECONDS,
-    SAM_WORKER_MODEL,
     SAM_MAIN_MODEL,
+    SAM_MAIN_VERTEX_LOCATION,
     SAM_SRC,
+    SAM_WORKER_MODEL,
+    SAM_WORKER_VERTEX_LOCATION,
     STUCK_TIMEOUT_SECONDS,
     log,
 )
@@ -260,25 +270,84 @@ def _load_worker_instruction() -> str:
 # ─── Model routing ────────────────────────────────────────────────────────────
 
 
-def _generate_adk_model(model_id: str):
+def _make_gemini_at_location(location: str):
+    """Factory: produce a Gemini subclass pinned to a specific Vertex location.
+
+    ADK's stock `Gemini` reads `GOOGLE_CLOUD_LOCATION` from the environment
+    inside its cached `api_client` property, which is process-global — so two
+    agents in the same process can't target two different Vertex endpoints.
+    Sam needs that split: main on `global` (Gemini 3.x preview is global-only)
+    and workers on `eu` (data residency for the higher-volume worker traffic).
+
+    Workaround: subclass `Gemini` and override `api_client` to construct a
+    `genai.Client` with `location` explicitly pinned. See upstream feature
+    request https://github.com/google/adk-python/issues/5027 — once
+    `Gemini(client=...)` is supported, this factory goes away.
+    """
+    from functools import cached_property
+    from google.adk.models.google_llm import Gemini
+    from google.genai import Client
+    from google.genai import types as genai_types
+
+    pinned_location = location  # close over for the cached_property below
+
+    class _GeminiPinned(Gemini):
+        @cached_property
+        def api_client(self) -> Client:
+            project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+            if not project:
+                raise RuntimeError(
+                    "GOOGLE_CLOUD_PROJECT must be set for Vertex AI Gemini. "
+                    "See .env.example."
+                )
+            # Preserve the http_options ADK's base Gemini builds (tracking
+            # headers, retry_options, base_url, api_version) so behaviour
+            # matches stock except for the explicit location.
+            base_url, api_version = self._base_url_and_api_version
+            http_kwargs: dict = {
+                "headers": self._tracking_headers(),
+                "retry_options": self.retry_options,
+                "base_url": base_url,
+            }
+            if api_version:
+                http_kwargs["api_version"] = api_version
+            return Client(
+                vertexai=True,
+                project=project,
+                location=pinned_location,
+                http_options=genai_types.HttpOptions(**http_kwargs),
+            )
+
+    return _GeminiPinned
+
+
+def _generate_adk_model(model_id: str, *, vertex_location: str | None = None):
     """Return whatever `LlmAgent(model=...)` should receive for this model ID.
 
     Two paths:
+    - Gemini → returns a `Gemini` subclass instance with `vertex_location`
+      pinned via `_make_gemini_at_location`. `vertex_location` is REQUIRED
+      (no env-var fallback); relying on `GOOGLE_CLOUD_LOCATION` would
+      silently route every agent in the process to the same endpoint,
+      collapsing the main/worker split.
     - `claude-*` → returns an ADK `Claude` instance with a subclass that
       injects the correct `base_url` for EU/US multi-region endpoints.
-      Stock ADK uses AnthropicVertex's default `{region}-aiplatform.googleapis.com`
-      hostname, which doesn't exist for multi-region values like "eu";
-      the working host is `aiplatform.{region}.rep.googleapis.com/v1`.
-    - Anything else (Gemini) → return the plain string; ADK's native Gemini
-      client handles routing, including EU multi-region.
+      Stock AnthropicVertex's `{region}-aiplatform.googleapis.com` hostname
+      doesn't exist for multi-region values like "eu"; the working host is
+      `aiplatform.{region}.rep.googleapis.com/v1`. Claude reads location
+      from env because Anthropic on Vertex only serves regional endpoints
+      (never "global"), so the single-env-var assumption holds.
 
-    Both paths read project/location from `GOOGLE_CLOUD_PROJECT` /
-    `GOOGLE_CLOUD_LOCATION` so the .env stays single-source. Lazy-imports
-    keep the module loadable in test envs where google-adk isn't installed.
+    Lazy-imports keep the module loadable in test envs where google-adk
+    isn't installed.
     """
     if not model_id.startswith("claude-"):
-        # Native ADK Gemini — pass through.
-        return model_id
+        if vertex_location is None:
+            raise ValueError(
+                f"vertex_location is required for Gemini models (got model_id={model_id!r}). "
+                "Pass SAM_MAIN_VERTEX_LOCATION or SAM_WORKER_VERTEX_LOCATION."
+            )
+        return _make_gemini_at_location(vertex_location)(model=model_id)
 
     from functools import cached_property
     from anthropic import AsyncAnthropicVertex
@@ -332,7 +401,7 @@ def _generate_adk_model(model_id: str):
 # ─── Parallel worker fan-out ──────────────────────────────────────────────────
 
 
-def _make_parallel_workers_tool(worker_instruction: str, bash_tool):
+def _make_parallel_workers_tool(worker_instruction: str, bash_tool, worker_vertex_location: str):
     """Return a coroutine that fans out N worker tasks in parallel via asyncio.gather.
 
     Each task gets a fresh LlmAgent(worker) + InMemorySessionService so there
@@ -370,7 +439,7 @@ def _make_parallel_workers_tool(worker_instruction: str, bash_tool):
         async def run_one(task: str, idx: int) -> str:
             worker = LlmAgent(
                 name=f"worker_{idx}",
-                model=_generate_adk_model(SAM_WORKER_MODEL),
+                model=_generate_adk_model(SAM_WORKER_MODEL, vertex_location=worker_vertex_location),
                 instruction=worker_instruction,
                 tools=[
                     FunctionTool(func=bash_tool),
@@ -426,10 +495,10 @@ def _make_parallel_workers_tool(worker_instruction: str, bash_tool):
 class ADKAgentRunner:
     """Runs a Sam session using Google ADK on Vertex AI.
 
-    Inverted architecture: main is Claude Opus 4.7 (deep reasoning, Slack
-    composition); workers are Gemini 3.1 Flash-Lite (fast, focused tasks)
-    accessible via the `worker` (single) and `parallel_workers` (fan-out)
-    tools.
+    Inverted architecture: main is Gemini 3.1 Pro Preview (deep reasoning,
+    Slack composition); workers are Gemini 3.5 Flash (fast, focused
+    tasks) accessible via the `worker` (single) and `parallel_workers`
+    (fan-out) tools.
 
     Vertex AI auth must be present in the environment before the runner is
     used — specifically GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, and
@@ -477,23 +546,23 @@ class ADKAgentRunner:
 
         worker_instruction = _load_worker_instruction()
 
-        # `worker` — single dispatch to one Flash-Lite worker.
+        # `worker` — single dispatch to one worker (SAM_WORKER_MODEL).
         worker_agent = LlmAgent(
             name="worker",
-            model=_generate_adk_model(SAM_WORKER_MODEL),
+            model=_generate_adk_model(SAM_WORKER_MODEL, vertex_location=SAM_WORKER_VERTEX_LOCATION),
             instruction=worker_instruction,
             tools=worker_tools,
         )
 
         # `parallel_workers` — fan-out to N fresh workers concurrently.
         parallel_workers = _make_parallel_workers_tool(
-            worker_instruction, bash_tool
+            worker_instruction, bash_tool, SAM_WORKER_VERTEX_LOCATION
         )
 
-        # Main — Opus 4.7, full tools including worker dispatch.
+        # Main agent — uses SAM_MAIN_MODEL on SAM_MAIN_VERTEX_LOCATION.
         main_agent = LlmAgent(
             name="sam",
-            model=_generate_adk_model(SAM_MAIN_MODEL),
+            model=_generate_adk_model(SAM_MAIN_MODEL, vertex_location=SAM_MAIN_VERTEX_LOCATION),
             instruction=request.system_prompt,
             tools=[
                 *worker_tools,

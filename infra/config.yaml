@@ -9,8 +9,12 @@
 
 # ── GCP project + regions ──────────────────────────────────────────────────
 gcp_project_id: dembrane-sameer-cli
-gcp_region: europe-west1     # Cloud Run + Artifact Registry (must be a specific EU region)
-vertex_location: eu          # Vertex AI multi-region literal — only Vertex understands "eu"
+gcp_region: europe-west1     # Cloud Run + Artifact Registry — Sam the service runs in EU
+vertex_location: eu          # Sets GOOGLE_CLOUD_LOCATION on Cloud Run. NOT read by Gemini agents
+                             # (adk_runner.py pins per-agent location explicitly via
+                             # SAM_MAIN_VERTEX_LOCATION / SAM_WORKER_VERTEX_LOCATION).
+                             # Only the dormant Claude path reads this env var. Keep "eu"
+                             # so re-enabling Claude works without flipping anything else.
 
 # ── Slack identity  ────────────────────────────────
 slack_channel: C0B2VBYU79V

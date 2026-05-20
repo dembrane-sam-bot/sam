@@ -128,7 +128,7 @@ When the diff is purely identity/scope/capability prose (no paths, no commands, 
 
 ### Be trigger-happy with parallel workers for verification
 
-These verifications are cheap. Sam's workers run on Gemini 3.1 Flash-Lite with full tool access (`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`) — well under a cent per worker invocation and orders of magnitude cheaper than Sam's main-loop Opus turns. There's no reason to verify serially when Sam can fan out.
+These verifications are cheap. Sam's workers run on Gemini 3.5 Flash with full tool access (`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`) — well under a cent per worker invocation and orders of magnitude cheaper than Sam's main-loop turns. There's no reason to verify serially when Sam can fan out.
 
 Default to firing 4–6 small workers in parallel rather than running checks one at a time. One worker per check: "does file X exist?", "does flag Y exist on command Z?", "does skill slug W resolve?", etc. The roundtrip waste from one unverified assumption costs more than dispatching ten workers that all came back ✓.
 
