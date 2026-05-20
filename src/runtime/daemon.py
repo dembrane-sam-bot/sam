@@ -991,13 +991,47 @@ class Daemon:
 
         await self.shutdown_event.wait()
 
-        log.info("shutting down")
+        log.info("shutting down: stopping inbound, draining in-flight session")
+
+        # Stop new wake-ups: cron skills, catch-up, the Slack socket listener.
+        # These have no mid-execution state we need to preserve, so cancel +
+        # await is the right move. Cancel the socket FIRST so no new events
+        # land while we're trying to drain.
         for t in cron_tasks:
             t.cancel()
         catchup_task.cancel()
         socket_task.cancel()
-        worker_task.cancel()
-        for t in (*cron_tasks, catchup_task, socket_task, worker_task):
+
+        # The worker is the one task we deliberately don't cancel. It may be
+        # mid-session, and cancelling would abort `SamSession.run()` partway
+        # through — which is exactly the failure mode we're fixing. Instead,
+        # `shutdown_event` is already set; the worker loop checks it between
+        # iterations, so it'll exit naturally after the current session
+        # completes. Wait for that, capped by `DRAIN_TIMEOUT_SECONDS`.
+        #
+        # Effective ceiling: Cloud Run's SIGTERM→SIGKILL grace period
+        # (default 10s for services). We set 25s here so this works once the
+        # platform grace is bumped; today the kernel may kill us before this
+        # timeout fires, but the drain itself is still useful for the
+        # sub-10s case (most sessions are either done quickly or genuinely
+        # long-running, and the short ones benefit immediately).
+        DRAIN_TIMEOUT_SECONDS = 25
+        try:
+            await asyncio.wait_for(worker_task, timeout=DRAIN_TIMEOUT_SECONDS)
+            log.info("worker drained cleanly")
+        except asyncio.TimeoutError:
+            log.warning(
+                "worker did not drain in %ds; cancelling in-flight session",
+                DRAIN_TIMEOUT_SECONDS,
+            )
+            worker_task.cancel()
+            try:
+                await worker_task
+            except (asyncio.CancelledError, Exception):  # noqa: S110  # shutdown cleanup; logging would be noise
+                pass
+
+        # Reap the already-cancelled non-worker tasks.
+        for t in (*cron_tasks, catchup_task, socket_task):
             try:
                 await t
             except (asyncio.CancelledError, Exception):  # noqa: S110  # shutdown cleanup; logging would be noise
