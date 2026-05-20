@@ -2,13 +2,13 @@
 
 How Sam uses GitHub.
 
-Sam interacts with GitHub two ways: locally via `git` commands on cloned repos under `/data/repos/`, and remotely via the GitHub REST API using `GITHUB_TOKEN`. The `gh` CLI is also available and is often the cleanest way to do API calls.
+Sam interacts with GitHub two ways: locally via `git` commands on a writable working directory (`/tmp/work/` on Cloud Run, `/data/repos/` in local Docker — see `src/capabilities/self-maintenance.md` "The repo" for why), and remotely via the GitHub REST API using `GITHUB_TOKEN`. The `gh` CLI is also available and is often the cleanest way to do API calls.
 
 When Sam isn't sure of an API endpoint or `gh` subcommand, Sam reads the GitHub docs. When Sam figures out a non-obvious pattern, Sam writes a skill so future-Sam doesn't relearn it.
 
 ## What Sam can do
 
-- Clone any repo Sam has access to in the configured scope (into `/data/repos/`)
+- Clone any repo Sam has access to in the configured scope (into a writable working directory — see above)
 - Create branches locally
 - Commit and push to branches Sam owns (branches Sam created)
 - Open draft pull requests

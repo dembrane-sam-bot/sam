@@ -10,7 +10,7 @@ Sam reads this before making the first change to its own source, and re-reads wh
 
 ## The repo
 
-`dembrane/sam` on GitHub. Same access pattern as any other Dembrane repo — clone via HTTPS using `GITHUB_TOKEN`. The local checkout lives at `/data/repos/sam/`.
+`dembrane/sam` on GitHub. Same access pattern as any other Dembrane repo — clone via HTTPS using `GITHUB_TOKEN`. Pick a writable working directory for the clone: `/tmp/work/sam/` on Cloud Run (where `/data` is a gcs-fuse mount that rejects `chmod` and breaks `git clone`), or `/data/repos/sam/` in local Docker (where `/data` is a normal volume). Test with `mkdir -p <path> && touch <path>/.probe` once if unsure; the failure mode on the wrong path is `chmod on .git/config.lock failed: Operation not permitted`.
 
 If the repo isn't cloned yet, clone it. Sam doesn't need to ask permission to clone its own repo.
 
@@ -66,7 +66,7 @@ If a signal could fit in two places, pick the more specific target first (skill 
 
 ## The flow
 
-1. Make sure the local `/data/repos/sam/` is up to date (`git fetch && git checkout main && git pull`)
+1. Make sure the local checkout (see "The repo" above for the right path on this runtime) is up to date (`git fetch && git checkout main && git pull`)
 2. Create a branch: `sam/update-<short-description>` — e.g. `sam/update-add-linear-skill`
 3. Make the change. One change per PR. Don't combine "add a skill" with "fix identity wording" — they review differently.
 4. Commit using the same terse, lowercase style the repo already uses. Do not add `Co-Authored-By` trailers.
@@ -88,7 +88,7 @@ The PR description should answer:
 
 Before pushing a self-PR branch, Sam scans the *staged diff* for obvious leaks. The point isn't to replace CI gitleaks — it's to catch the easy-in-hindsight stuff *before* the leak lands on a public branch. Once a commit is pushed, the unmerged branch is still public, and the window between push and force-removal is enough for scrapers.
 
-Sam doesn't have docker or gitleaks inside the runtime, but does have `rg` and `git`. Run this from `/data/repos/sam/` after staging changes (`git add ...`) and before `git commit`:
+Sam doesn't have docker or gitleaks inside the runtime, but does have `rg` and `git`. Run this from the local checkout after staging changes (`git add ...`) and before `git commit`:
 
 ```bash
 git diff --cached | rg -e 'xoxb-[0-9]' -e 'xapp-[0-9]' -e 'github_pat_[0-9A-Za-z_]{30,}' -e 'ghp_[0-9A-Za-z]{30,}' -e 'lin_api_[A-Za-z0-9]{20,}' -e '-----BEGIN [A-Z]+ PRIVATE KEY-----' && echo "POSSIBLE LEAK — fix before commit" || echo "diff looks clean"
