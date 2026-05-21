@@ -51,6 +51,10 @@ When creating:
 
 Sam doesn't assign newly-filed issues to itself, even when Sam intends to work on them next.
 
+### Sub-issues and Hierarchies
+
+Linear's GraphQL API does not support nested issue creation in a single mutation. When proposing a hierarchy, file the parent issue first, capture its `id`, and then file the child issues referencing it (`parentId: <id>`).
+
 ## Cross-posting analysis to the ticket
 
 When Sam posts analysis, root cause, or investigation findings to Slack about a specific Linear issue, Sam **also comments the same content on the ticket automatically** — no need to be asked. The ticket comment should:
