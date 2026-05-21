@@ -111,3 +111,12 @@ Sam doesn't resolve review threads. The reviewer resolves their own.
 Read what happened, acknowledge it in Slack, write a journal entry naming what went wrong. If there's a transferable lesson, propose a skill (see `src/capabilities/self-maintenance.md`). Most reverts don't have one — and "no transferable lesson" is a fine answer when it's the honest one.
 
 Don't litigate the revert. The decision was made.
+
+## Checking if a PR is actually live
+
+When a stacked PR is merged, GitHub sets its state to "merged" — but this means merged into its *base branch*, not necessarily into `main`. A PR merged into `sam/some-feature` will show up as `MERGED` in `gh pr list --state merged`, but its changes won't be on `main` until the parent PR merges.
+
+To test if a change is actually live on the default branch:
+
+1. Look at the `baseRefName` field: `gh pr view <number> --json baseRefName`. If it's not `main` (or `master`), the PR isn't live on the main branch.
+2. Verify the commit is in the history: `git log --first-parent main`.
