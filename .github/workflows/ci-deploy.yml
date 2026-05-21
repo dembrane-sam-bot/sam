@@ -58,8 +58,20 @@ jobs:
 
       - name: Python dependency CVE scan (pip-audit)
         # Fails on any known vulnerability in pinned deps. To ignore a specific
-        # one (e.g. unfixable upstream), add `--ignore-vuln GHSA-xxxx-xxxx-xxxx`.
-        run: pip-audit -r src/runtime/requirements.txt
+        # advisory (disputed, unfixable upstream, or unreachable code path),
+        # add its ID to .pipauditignore at the repo root with a rationale —
+        # same pattern as .trivyignore. Each non-comment line in that file
+        # becomes a `--ignore-vuln <id>` flag passed below.
+        run: |
+          IGNORE_ARGS=()
+          if [ -f .pipauditignore ]; then
+            while IFS= read -r line; do
+              [[ "$line" =~ ^[[:space:]]*# ]] && continue
+              [[ -z "${line// }" ]] && continue
+              IGNORE_ARGS+=(--ignore-vuln "$line")
+            done < .pipauditignore
+          fi
+          pip-audit -r src/runtime/requirements.txt "${IGNORE_ARGS[@]}"
 
       # Secret scanning: deferred to GitHub's native secret scanning (free for
       # public repos, auto-runs on every push, surfaces in repo Security tab).

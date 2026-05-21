@@ -1,0 +1,14 @@
+# CVEs pip-audit reports that we deliberately accept, with rationale.
+# Re-evaluate this file when the underlying packages get rebuilt with
+# upstream fixes — these are not permanent ignores.
+#
+# Format: one advisory ID per line. Blank lines and `#` comments ignored
+# by the parser in .github/workflows/ci-deploy.yml. Match the style of
+# .trivyignore at the repo root.
+
+# pyjwt — PYSEC-2025-183 (advisory disputed upstream, no fix released).
+# PyJWT is a transitive dep here (pulled via slack-bolt's auth path) with
+# no direct use in Sam's source. The PyJWT maintainers have contested the
+# advisory's validity and have not published a patched version. Drop this
+# ignore once a real fix lands or the advisory is withdrawn from OSV.
+PYSEC-2025-183
