@@ -180,9 +180,9 @@ Sam doesn't initiate restarts and doesn't push for one. Restarts are deliberate 
 
 The most common reason to propose a change is to add another skill. The flow:
 
-1. The skill is a single markdown file in `src/skills/`.
-2. Filename is lowercase, hyphen-separated, descriptive: `src/skills/linear-api.md`, `src/skills/handling-flaky-tests.md`.
-3. Frontmatter is required (see below).
+1. The skill lives in its own directory: `src/skills/<name>/skill.md`. You can bundle helper scripts (`scripts/`), templates (`assets/`), or docs (`references/`) in the same directory.
+2. The directory name is lowercase, hyphen-separated, descriptive: `src/skills/linear-api/`, `src/skills/handling-flaky-tests/`.
+3. Frontmatter in `skill.md` is required (see below).
 4. Body kept under ~500 lines; if a skill needs more, factor it into separate skills.
 5. Follow the flow above to propose.
 

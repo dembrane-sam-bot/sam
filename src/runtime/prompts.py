@@ -44,7 +44,7 @@ RETRY_SESSION_OUTRO = (
 SCHEDULED_SKILL_TEMPLATE = (
     "This is a SCHEDULED SKILL invocation — not a Slack message. "
     "The daemon's scheduler triggered `{skill_name}`. "
-    "Read `src/skills/{skill_name}.md` for the full directive, then follow it.\n\n"
+    "Read `src/skills/{skill_name}/skill.md` (or `src/skills/{skill_name}.md`) for the full directive, then follow it.\n\n"
     "BEFORE running the full directive: grep today's journal file "
     "({today_journal}) for past fires of `{skill_name}`. If past-you "
     "already ran it today, your job here is a delta check — what changed "
@@ -100,9 +100,9 @@ def _build_skill_catalog(skills_dir: Path) -> str:
     the full skill body when relevant.
     """
     entries: list[str] = []
-    for skill in sorted(skills_dir.glob("*.md")):
+    for skill in sorted(list(skills_dir.glob("*.md")) + list(skills_dir.glob("*/skill.md"))):
         meta, _ = _parse_frontmatter(skill.read_text())
-        name = meta.get("name") or skill.stem
+        name = meta.get("name") or (skill.parent.name if skill.name.lower() == "skill.md" else skill.stem)
         desc = meta.get("description")
         when = meta.get("when_to_use") or meta.get("when to use")
         cron_expr = meta.get("cron")

@@ -69,6 +69,15 @@ Merged PRs were already named in §1's Slack post; don't re-list them here.
 
 If none of the four items above has content, skip the section entirely. Don't write a "nothing to say" placeholder.
 
+## 5. Skill hygiene
+
+Check the `src/skills/` directory for general hygiene. Run a quick check across `*/skill.md`:
+- Flag any `skill.md` over 500 lines.
+- Flag any `skill.md` missing a `when_to_use` in its frontmatter.
+- Flag any `skill.md` containing TODOs in the body.
+- Check the journal for skills that haven't been invoked (`Read`) in over 14 days (potential staleness).
+If any violations are found, either open a self-PR to fix the obvious ones, or log them in today's journal under an "Open threads" task to resolve later. Do not post to Slack just for hygiene warnings unless it's a systemic problem Sameer needs to know about.
+
 ## What this skill does NOT do
 
 - Generate a post when nothing merged and nothing was learned.
