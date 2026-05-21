@@ -134,6 +134,10 @@ class Daemon:
         self.shutdown_event = asyncio.Event()
         self.bot_user_id: Optional[str] = None
         self.sam_channel_name: Optional[str] = None
+        # Channels Sam is a member of (resolved at startup via users.conversations).
+        # When SAM_CHANNEL is unset, this is the scope; when SAM_CHANNEL is set, it
+        # narrows scope further to just that one channel for dev/testing.
+        self.member_channels: set[str] = set()
         # Recent message ts values we've already queued, to dedupe app_mention
         # and message events that fire for the same underlying Slack message.
         self._seen_ts: set[str] = set()
@@ -161,11 +165,63 @@ class Daemon:
         return True
 
     def _channel_allowed(self, channel: Optional[str]) -> bool:
+        """Channel admission check.
+
+        Sam responds in any channel it's a member of (set via Slack invites
+        and discovered at startup via `users.conversations`). If `SAM_CHANNEL`
+        is also set, scope narrows to that single channel — useful for
+        dev/testing against one room.
+        """
         if not channel:
             return False
-        if SAM_CHANNEL and channel != SAM_CHANNEL:
-            return False
-        return True
+        if SAM_CHANNEL:
+            return channel == SAM_CHANNEL
+        return channel in self.member_channels
+
+    async def _resolve_member_channels(self) -> set[str]:
+        """Enumerate channels Sam is a member of via `users.conversations`.
+
+        Slack's `users.conversations` returns the calling user's (here, the
+        bot's) channel memberships. We include public + private channels;
+        DMs are deliberately excluded by the `types` filter — per Sam's
+        scope, no DM handling.
+
+        Drains all pages. On any API failure mid-pagination, log and return
+        whatever we've collected — degrading to fewer channels is better
+        than crashing startup.
+        """
+        channels: set[str] = set()
+        cursor: Optional[str] = None
+        page = 0
+        while True:
+            page += 1
+            kwargs: dict = {"types": "public_channel,private_channel", "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            try:
+                resp = await self.app.client.users_conversations(**kwargs)
+            except Exception:
+                log.exception("users.conversations failed on page %d", page)
+                break
+            for ch in resp.get("channels", []):
+                ch_id = ch.get("id")
+                if ch_id:
+                    channels.add(ch_id)
+            cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+        return channels
+
+    def _catchup_target_channels(self) -> list[str]:
+        """Channels to scan during boot catch-up.
+
+        If `SAM_CHANNEL` is set (single-channel dev mode), scope to just
+        that. Otherwise, every channel Sam is a member of, in stable order
+        for deterministic logging.
+        """
+        if SAM_CHANNEL:
+            return [SAM_CHANNEL]
+        return sorted(self.member_channels)
 
     def _is_side_pane_event(self, event: dict) -> bool:
         """Detect Agents & AI Apps assistant-thread (side-pane) messages.
@@ -626,18 +682,46 @@ class Daemon:
                  message.display_name or "?", message.user, principal_note,
                  message.channel, message.event_ts, attachment_note)
 
+    def _sam_finished(self, msg: dict) -> bool:
+        """Has Sam reached a terminal reaction state on this message?
+
+        Terminal = `:white_check_mark:` (success) or `:x:` (both-attempts-
+        failed, operator-alert posted). Either means Sam shouldn't re-queue.
+        Maintained by `_mark_lifecycle` in the worker; piggybacks on Slack's
+        reaction state so the daemon doesn't need a separate persisted set.
+
+        Reactions are inlined in `conversations.history` and
+        `conversations.replies` responses — no extra API call needed.
+        """
+        if not self.bot_user_id:
+            return False
+        for reaction in msg.get("reactions") or []:
+            if reaction.get("name") not in ("white_check_mark", "x"):
+                continue
+            if self.bot_user_id in (reaction.get("users") or []):
+                return True
+        return False
+
     async def _catch_up(self) -> None:
         """Replay messages missed while the daemon was offline.
 
-        Scans the whitelisted channel's history since the cursor:
-        - Top-level messages that @mention the bot are queued directly.
+        Scans the history of every target channel since `max(cursor, now-24h)`:
+        - Top-level messages that @mention the bot are candidates.
         - Top-level messages whose `reply_users` includes the bot have their
-          replies fetched and queued (replies newer than the cursor).
+          replies fetched and added as candidates.
 
-        Limitation: a thread whose parent ts is older than the cursor but
-        which received replies during downtime won't be discovered here.
-        Re-@mentioning in the thread surfaces it again. This is the trade-off
-        for not persisting any thread list locally.
+        Then each candidate is checked against Sam's reaction state — any
+        message Sam already terminal-processed (`:white_check_mark:` / `:x:`)
+        is skipped. Messages still at `:hourglass_flowing_sand:` or `:eyes:`
+        (interrupted sessions, or queued-but-not-started) are re-queued.
+
+        Why the 24h cap: if Sam was down for days, we don't want to replay
+        a backlog of stale messages. Re-@mentioning in the thread re-surfaces
+        anything older.
+
+        Limitation: a thread whose parent ts is older than the scan window
+        but which received replies during downtime won't be discovered here.
+        Re-@mentioning surfaces it again.
         """
         last_seen = load_cursor()
         if last_seen is None:
@@ -645,77 +729,103 @@ class Daemon:
             save_cursor(f"{time.time():.6f}")
             return
 
-        if not SAM_CHANNEL:
-            log.info("catch-up: SAM_CHANNEL unset, skipping")
+        channels_to_scan = self._catchup_target_channels()
+        if not channels_to_scan:
+            log.info(
+                "catch-up: nothing to scan (SAM_CHANNEL unset and member-channel set empty)",
+            )
             return
 
-        log.info("catch-up: scanning since ts=%s", last_seen)
+        # Cap the scan window so a long outage doesn't replay days of backlog.
+        # 24h gives the operator a clear re-surface mechanism (@-mention) for
+        # anything older without storming the queue at boot.
+        oldest_ts = max(float(last_seen), time.time() - 86400)
+        oldest_str = f"{oldest_ts:.6f}"
+        log.info(
+            "catch-up: scanning %d channel(s) since ts=%s (cursor=%s, 24h cap=%s)",
+            len(channels_to_scan), oldest_str, last_seen,
+            f"{time.time() - 86400:.6f}",
+        )
         client = self.app.client
         candidates: list[dict] = []
 
-        try:
-            resp = await client.conversations_history(
-                channel=SAM_CHANNEL,
-                oldest=last_seen,
-                inclusive=False,
-                limit=200,
-            )
-            top_level = resp.get("messages", [])
-        except Exception:
-            log.exception("catch-up: history fetch failed")
-            top_level = []
-
-        for msg in top_level:
-            if msg.get("subtype") not in ALLOWED_MESSAGE_SUBTYPES:
-                continue
-            if msg.get("bot_id") or msg.get("user") == self.bot_user_id:
-                continue
-            text = msg.get("text", "")
-            if self.bot_user_id and f"<@{self.bot_user_id}>" in text:
-                msg["channel"] = SAM_CHANNEL
-                candidates.append(msg)
-
-        # Threads with bot participation that gained replies during downtime.
-        for msg in top_level:
-            if msg.get("reply_count", 0) <= 0:
-                continue
-            if self.bot_user_id not in (msg.get("reply_users") or []):
-                continue
-            thread_ts = msg.get("ts")
-            if not thread_ts:
-                continue
+        for channel in channels_to_scan:
             try:
-                replies = await client.conversations_replies(
-                    channel=SAM_CHANNEL,
-                    ts=thread_ts,
-                    oldest=last_seen,
+                resp = await client.conversations_history(
+                    channel=channel,
+                    oldest=oldest_str,
                     inclusive=False,
                     limit=200,
                 )
+                top_level = resp.get("messages", [])
             except Exception:
-                log.exception("catch-up: replies fetch failed for thread %s", thread_ts)
+                log.exception("catch-up: history fetch failed for %s", channel)
                 continue
-            for reply in replies.get("messages", []):
-                if reply.get("ts") == thread_ts:
-                    continue
-                if reply.get("subtype") not in ALLOWED_MESSAGE_SUBTYPES:
-                    continue
-                if reply.get("bot_id") or reply.get("user") == self.bot_user_id:
-                    continue
-                reply["channel"] = SAM_CHANNEL
-                candidates.append(reply)
 
-        # Chronological, deduped by ts.
+            for msg in top_level:
+                if msg.get("subtype") not in ALLOWED_MESSAGE_SUBTYPES:
+                    continue
+                if msg.get("bot_id") or msg.get("user") == self.bot_user_id:
+                    continue
+                text = msg.get("text", "")
+                if self.bot_user_id and f"<@{self.bot_user_id}>" in text:
+                    msg["channel"] = channel
+                    candidates.append(msg)
+
+            # Threads with bot participation that gained replies during downtime.
+            for msg in top_level:
+                if msg.get("reply_count", 0) <= 0:
+                    continue
+                if self.bot_user_id not in (msg.get("reply_users") or []):
+                    continue
+                thread_ts = msg.get("ts")
+                if not thread_ts:
+                    continue
+                try:
+                    replies = await client.conversations_replies(
+                        channel=channel,
+                        ts=thread_ts,
+                        oldest=oldest_str,
+                        inclusive=False,
+                        limit=200,
+                    )
+                except Exception:
+                    log.exception(
+                        "catch-up: replies fetch failed for %s thread %s",
+                        channel, thread_ts,
+                    )
+                    continue
+                for reply in replies.get("messages", []):
+                    if reply.get("ts") == thread_ts:
+                        continue
+                    if reply.get("subtype") not in ALLOWED_MESSAGE_SUBTYPES:
+                        continue
+                    if reply.get("bot_id") or reply.get("user") == self.bot_user_id:
+                        continue
+                    reply["channel"] = channel
+                    candidates.append(reply)
+
+        # Chronological, deduped by ts. Skip anything Sam already
+        # terminal-processed (✅ or ❌) — this is the duplicate-reply guard.
+        # A message that's only at :eyes: or :hourglass_flowing_sand: is
+        # interrupted and gets re-queued.
         candidates.sort(key=lambda m: float(m["ts"]))
         seen: set[str] = set()
         queued = 0
+        skipped_terminal = 0
         for msg in candidates:
             if msg["ts"] in seen:
                 continue
             seen.add(msg["ts"])
+            if self._sam_finished(msg):
+                skipped_terminal += 1
+                continue
             await self._handle_event(msg)
             queued += 1
-        log.info("catch-up: queued %d message(s)", queued)
+        log.info(
+            "catch-up: queued %d message(s), skipped %d already-terminal",
+            queued, skipped_terminal,
+        )
 
     async def _worker(self) -> None:
         """Single worker that drains the queue, one session at a time.
@@ -962,6 +1072,15 @@ class Daemon:
                 log.info("Sam channel resolved: #%s (%s)", self.sam_channel_name, SAM_CHANNEL)
             except Exception:
                 log.exception("conversations.info failed; side-pane redirect will use a generic phrase")
+
+        # Resolve every channel Sam is a member of. Used by catch-up (when
+        # SAM_CHANNEL is unset) and by `_channel_allowed` for inbound routing.
+        # Adding Sam to a new channel takes effect on next daemon restart;
+        # we don't refresh mid-run (the API is rate-limited, and Slack's
+        # membership events would let us track deltas if we ever want live
+        # updates).
+        self.member_channels = await self._resolve_member_channels()
+        log.info("Sam is a member of %d channel(s)", len(self.member_channels))
 
         # Cloud Run startup probe requires an HTTP server on $PORT before the
         # revision is marked healthy. Sam is otherwise outbound-only (Slack
