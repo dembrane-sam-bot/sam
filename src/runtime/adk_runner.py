@@ -50,11 +50,14 @@ import asyncio
 import os
 import subprocess
 import time
+import json
+import datetime
 from pathlib import Path
 from typing import Optional
 
 from .config import (
     MAX_SESSION_SECONDS,
+    redact_secrets,
     SAM_MAIN_MODEL,
     SAM_MAIN_VERTEX_LOCATION,
     SAM_SRC,
@@ -450,6 +453,8 @@ def _make_parallel_workers_tool(worker_instruction: str, bash_tool, worker_verte
                     FunctionTool(func=glob_files),
                     FunctionTool(func=fetch_url),
                 ],
+                before_tool_callback=_audit_before_tool,
+                after_tool_callback=_audit_after_tool,
             )
             svc = InMemorySessionService()
             worker_runner = Runner(
@@ -491,6 +496,64 @@ def _make_parallel_workers_tool(worker_instruction: str, bash_tool, worker_verte
 
 # ─── ADK runner ───────────────────────────────────────────────────────────────
 
+
+_tool_starts: dict[int, float] = {}
+
+def _redact_dict(d: dict) -> dict:
+    try:
+        s = json.dumps(d)
+        r = redact_secrets(s)
+        return json.loads(r)
+    except Exception:
+        return d
+
+def _audit_before_tool(tool, args, tool_context):
+    _tool_starts[id(tool_context)] = time.time()
+    return None
+
+def _audit_after_tool(tool, args, tool_context, tool_response):
+    start = _tool_starts.pop(id(tool_context), None)
+    duration_ms = int((time.time() - start) * 1000) if start else None
+    
+    try:
+        session_id = tool_context.invocation_context.session.id
+    except AttributeError:
+        session_id = "unknown"
+        
+    try:
+        agent_name = tool_context.agent_name
+    except AttributeError:
+        agent_name = "unknown"
+        
+    date_str = datetime.date.today().isoformat()
+    log_path = Path(f"/data/tool_calls/{date_str}.jsonl")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        args_dict = dict(args)
+    except Exception:
+        args_dict = {}
+        
+    resp_str = str(tool_response)
+    
+    record = {
+        "ts": time.time(),
+        "session_id": session_id,
+        "agent": agent_name,
+        "tool": tool.name,
+        "args": _redact_dict(args_dict),
+        "result_preview": resp_str[:2000],
+        "result_size": len(resp_str),
+        "duration_ms": duration_ms,
+    }
+    
+    try:
+        with log_path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+        
+    return None
 
 class ADKAgentRunner:
     """Runs a Sam session using Google ADK on Vertex AI.
@@ -552,6 +615,8 @@ class ADKAgentRunner:
             model=_generate_adk_model(SAM_WORKER_MODEL, vertex_location=SAM_WORKER_VERTEX_LOCATION),
             instruction=worker_instruction,
             tools=worker_tools,
+            before_tool_callback=_audit_before_tool,
+            after_tool_callback=_audit_after_tool,
         )
 
         # `parallel_workers` — fan-out to N fresh workers concurrently.
@@ -569,6 +634,8 @@ class ADKAgentRunner:
                 AgentTool(agent=worker_agent),
                 FunctionTool(func=parallel_workers),
             ],
+            before_tool_callback=_audit_before_tool,
+            after_tool_callback=_audit_after_tool,
         )
 
         session_service = InMemorySessionService()
