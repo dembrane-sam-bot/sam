@@ -29,6 +29,14 @@ This repo is Sam — identity, scope, capabilities, skills, and runtime. Read `s
     data/                 — Sam's working state (gitignored)
     .claude/              — Sam's Claude Code credentials (gitignored, created by `claude login` inside the container)
 
+## Design Decisions
+
+Why things are built the way they are:
+
+- **Inverted Architecture (Flash workers vs Pro main loop):** Sam's core orchestrator runs on a powerful reasoning model (Gemini Pro) to handle multi-hop planning, Slack context, and complex decisions. However, the actual execution (file reading, git commands, grepping) is farmed out to a fleet of cheap, fast workers running Gemini Flash via `worker` and `parallel_workers` tools. This solves the "stalling problem" of smaller models getting lost on multi-step tasks while avoiding the cost and latency of running every tool call through a huge model. Crucially, these workers have full write access (unlike typical read-only subagents); they are doers, not just readers.
+- **Filesystem-as-database:** Sam stores state (like the daily journal and cloned repos) directly as markdown files on disk rather than in a database. This ensures state is naturally version-controllable, deeply human-readable, easily grep-able by parallel workers, and fits cleanly into the LLM context window.
+- **Review Gates:** Sam has the ability to self-author PRs modifying its own logic and substrate (Tier 1-3). The architectural boundary for safety relies heavily on GitHub branch protection (a human must approve PRs on `main`). This pushes the burden of safety to the platform rather than relying entirely on prompt engineering.
+
 ## Capabilities vs skills
 
 Both live under `src/` as markdown files, but they're loaded differently and serve different purposes:
@@ -38,7 +46,22 @@ Both live under `src/` as markdown files, but they're loaded differently and ser
 
 Rule of thumb: if Sam should know it on every message, it's a capability. If Sam only needs it sometimes, it's a skill. Don't promote a skill to a capability to save Sam a `Read` — the lazy-load design is deliberate.
 
-See `src/capabilities/self-maintenance.md` for the skill-frontmatter convention and the flow for proposing changes.
+### How Sam's Skills differ from Anthropic / MCP
+While Anthropic's MCP (Model Context Protocol) and standard agent tools are active, executable programs or servers, Sam's skills are fundamentally just **lazy-loaded Markdown files**. They act as instruction manuals rather than execution environments. 
+
+Compared to Anthropic's flat-file skill structure:
+- **Folder-per-skill:** Sam structures skills in directories (`src/skills/<name>/skill.md`), allowing bundled helper scripts, templates, and references alongside the skill.
+- **Two-field split vs Pushy descriptions:** Anthropic merges "what this does" and "when to trigger it" into an aggressive `description` field. Sam splits them cleanly into `description` (catalog scanning) and `when_to_use` (boolean trigger conditions), keeping the catalog human-readable.
+- **Lightweight parser:** Sam deliberately stripped away the heavy subagent/eval-viewer machinery present in Anthropic's skill creator.
+
+## Routines
+
+Routines are proactive, scheduled tasks (like a cron job) that Sam executes independently without a human prompting via Slack. 
+
+- **Discovery and Scheduling:** A skill becomes a routine simply by adding a `cron: "expression"` field in its YAML frontmatter. On startup, the daemon scans `src/skills/` and spawns async background tasks for these schedules.
+- **Execution Mechanism:** When a cron fires, the daemon doesn't simulate a user message; it injects a synthetic `SCHEDULED SKILL invocation` block into a fresh session context and points Sam to read the target skill.
+- **Delta Checks & Silence:** Routines are instructed to grep the daily journal for past executions to perform "delta checks" (only processing what changed since last run). By default, if there is no new substance, Sam is instructed to remain silent and not post empty updates to Slack.
+- **Primary Example:** The built-in `daily-maintenance` routine (runs at 07:00 local time). It reviews yesterday's journal, reconciles open blockers in Linear, performs skill hygiene, checks for merged PRs, and opens Tier 1 self-PRs to codify newly learned patterns.
 
 ## Setup
 
@@ -118,4 +141,3 @@ Sam authors PRs against everything in this repo — including `src/runtime/` (Ti
 6. Cloud Run's startup probe gates the rollout; the liveness probe (`/healthz` every 60s, 10 failures = ~10 min) catches a hung daemon afterwards.
 
 Tier 3 PRs follow the same flow but with higher discipline — small scope, one concept, explicit justification. See `src/capabilities/self-maintenance.md` for what counts as which tier and the pre-push self-checks Sam runs before pushing.
-
