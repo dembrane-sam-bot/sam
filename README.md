@@ -5,7 +5,7 @@ An engineering coworker.
 This repo is Sam — identity, scope, capabilities, skills, and runtime. Read `src/identity.md` to understand who Sam is. Read files in `src/capabilities/` to understand the shape of Sam's work. Skills under `src/skills/` are the specific patterns Sam reaches for when triggered.
 
 ## Principles 
-![Sam](https://github.com/user-attachments/assets/755678fd-4a6f-4b2d-be7b-0992ee4421a4)
+![Sam](docs/image.png)
 
 - multiplayer, self maintaining claude code
 - communication channel
